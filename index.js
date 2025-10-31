@@ -48,15 +48,19 @@ let cache = { ts: 0, data: null };
 const CACHE_TTL_MS = 60 * 1000;
 
 // === Shared Browser (только для Exponent) ===
+// === Shared Browser ===
 let sharedBrowser = null;
 async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
 
   console.log('Puppeteer browser launching...');
 
+  // ДИНАМИЧЕСКИЙ ПУТЬ К ПОСЛЕДНЕЙ УСТАНОВКЕ CHROME
+  const chromePath = '/opt/render/.cache/puppeteer/chrome/latest/chrome-linux64/chrome';
+
   sharedBrowser = await puppeteer.launch({
     headless: true,
-    // УБРАЛ executablePath — Puppeteer найдёт сам в кэше
+    executablePath: chromePath,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -77,10 +81,6 @@ async function getSharedBrowser() {
   return sharedBrowser;
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 // === Поиск APY ===
 async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = false) {
   return pRetry(async (attempt) => {
@@ -89,8 +89,9 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
     let page;
 
     if (isRateX) {
-    browser = await puppeteer.launch({
+  browser = await puppeteer.launch({
     headless: true,
+    executablePath: '/opt/render/.cache/puppeteer/chrome/latest/chrome-linux64/chrome',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -99,8 +100,8 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
       '--disable-dev-shm-usage'
     ]
   });
-  page = await browser.newPage();  // ← ДОБАВЛЕНО!
-} else {
+  page = await browser.newPage();
+}else {
   browser = await getSharedBrowser();
   page = await browser.newPage();
 }
