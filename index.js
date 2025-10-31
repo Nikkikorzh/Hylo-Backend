@@ -54,10 +54,9 @@ async function getSharedBrowser() {
 
   console.log('Puppeteer browser launching...');
 
-  // ЯВНЫЙ ПУТЬ К CHROME + ОПТИМИЗАЦИЯ ДЛЯ 512MB
   sharedBrowser = await puppeteer.launch({
     headless: true,
-    executablePath: '/opt/render/.cache/puppeteer/chrome/linux-141.0.7390.122/chrome-linux64/chrome',
+    // УБРАЛ executablePath — Puppeteer найдёт сам в кэше
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -65,7 +64,7 @@ async function getSharedBrowser() {
       '--disable-features=IsolateOrigins,site-per-process',
       '--disable-blink-features=AutomationControlled',
       '--disable-dev-shm-usage',
-      '--single-process',           // КРИТИЧНО ДЛЯ 512MB
+      '--single-process',
       '--disable-gpu',
       '--no-zygote',
       '--disable-accelerated-2d-canvas',
@@ -90,22 +89,19 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
     let page;
 
     if (isRateX) {
-      browser = await puppeteer.launch({
-        headless: true,
-        executablePath: '/opt/render/.cache/puppeteer/chrome/linux-141.0.7390.122/chrome-linux64/chrome',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--single-process',
-          '--disable-gpu',
-          '--disable-dev-shm-usage'
-        ]
-      });
-      page = await browser.newPage();
-    } else {
-      browser = await getSharedBrowser();
-      page = await browser.newPage();
-    }
+  browser = await puppeteer.launch({
+    headless: true,
+    // УБРАЛ executablePath
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--single-process',
+      '--disable-gpu',
+      '--disable-dev-shm-usage'
+    ]
+  });
+  page = await browser.newPage();
+}
 
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
