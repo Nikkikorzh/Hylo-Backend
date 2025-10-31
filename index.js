@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import pRetry from 'p-retry';
 import puppeteer from 'puppeteer-core'; // <-- CORE!
+import chromium from '@sparticuz/chromium'; // <-- НОВОЕ: Chrome для Render
 
 dotenv.config();
 
@@ -48,54 +49,33 @@ let cache = { ts: 0, data: null };
 const CACHE_TTL_MS = 60 * 1000;
 
 // === Shared Browser (только для Exponent) ===
-// === Shared Browser ===
-// === Shared Browser ===
 let sharedBrowser = null;
 async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
 
   console.log('Puppeteer browser launching...');
 
-  // ДИНАМИЧЕСКИЙ ПОИСК CHROME
-  const fs = await import('fs');
-  const path = await import('path');
-  const puppeteerDir = '/opt/render/.cache/puppeteer/chrome';
-  let chromePath = null;
-
-  if (fs.existsSync(puppeteerDir)) {
-    const versions = fs.readdirSync(puppeteerDir).filter(dir => dir.startsWith('linux-'));
-    if (versions.length > 0) {
-      const latestVersion = versions[versions.length - 1];
-      chromePath = path.join(puppeteerDir, latestVersion, 'chrome-linux64/chrome');
-      console.log(`Found Chrome at: ${chromePath}`);
-    }
-  }
-
-  if (!chromePath) {
-    throw new Error('Chrome not found in cache');
-  }
-
   sharedBrowser = await puppeteer.launch({
-    headless: true,
-    executablePath: chromePath,
+    args: chromium.args,
+    defaultViewport: chromium.defaultViewport,
+    executablePath: await chromium.executablePath(),
+    headless: chromium.headless,
+    // Дополнительные флаги для обхода детекции
     args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
+      ...chromium.args,
       '--disable-web-security',
       '--disable-features=IsolateOrigins,site-per-process',
       '--disable-blink-features=AutomationControlled',
-      '--disable-dev-shm-usage',
-      '--single-process',
-      '--disable-gpu',
-      '--no-zygote',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run'
     ],
-    defaultViewport: null
   });
 
   console.log('Puppeteer browser launched');
   return sharedBrowser;
+}
+
+// === Sleep ===
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // === Поиск APY ===
@@ -105,52 +85,30 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
     let browser;
     let page;
 
-    if (isRateX) {
-  // Тот же динамический поиск
-  const fs = await import('fs');
-  const path = await import('path');
-  const puppeteerDir = '/opt/render/.cache/puppeteer/chrome';
-  let chromePath = null;
-
-  if (fs.existsSync(puppeteerDir)) {
-    const versions = fs.readdirSync(puppeteerDir).filter(dir => dir.startsWith('linux-'));
-    if (versions.length > 0) {
-      const latestVersion = versions[versions.length - 1];
-      chromePath = path.join(puppeteerDir, latestVersion, 'chrome-linux64/chrome');
-    }
-  }
-
-  if (!chromePath) {
-    throw new Error('Chrome not found for Rate-X');
-  }
-
-  browser = await puppeteer.launch({
-    headless: true,
-    executablePath: chromePath,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--single-process',
-      '--disable-gpu',
-      '--disable-dev-shm-usage'
-    ]
-  });
-  page = await browser.newPage();
-}else {
-  browser = await getSharedBrowser();
-  page = await browser.newPage();
-}
-
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.chrome = { runtime: {} };
-    });
-
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
     try {
+      if (isRateX) {
+        // Отдельный браузер для RateX
+        browser = await puppeteer.launch({
+          args: chromium.args,
+          defaultViewport: chromium.defaultViewport,
+          executablePath: await chromium.executablePath(),
+          headless: chromium.headless,
+        });
+      } else {
+        // Используем общий для Exponent
+        browser = await getSharedBrowser();
+      }
+      page = await browser.newPage();
+
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        window.chrome = { runtime: {} };
+      });
+
+      await page.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      );
+
       await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
 
       if (isRateX) {
@@ -422,6 +380,7 @@ app.post('/api/calc', (req, res) => {
 // === /health ===
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
+// === Shutdown ===
 process.on('SIGINT', async () => {
   console.log('Shutting down...');
   if (sharedBrowser) {
