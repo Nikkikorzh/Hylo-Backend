@@ -1,8 +1,9 @@
 import express from 'express';
 import cors from 'cors';
-import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
 import pRetry from 'p-retry';
+import puppeteer from 'puppeteer-core'; // <-- CORE!
+
 dotenv.config();
 
 const app = express();
@@ -11,7 +12,7 @@ app.use(express.json());
 
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// === URLs (ИСПРАВЛЕНО: 2601 для hyUSD/sHYUSD) ===
+// === URLs ===
 const EXPONENT_XSOL_1 = 'https://www.exponent.finance/liquidity/xsol-26Nov25-1';
 const EXPONENT_XSOL_2 = 'https://www.exponent.finance/liquidity/xsol-26Nov25';
 const EXPONENT_HYUSD = 'https://www.exponent.finance/liquidity/hyusd-15Dec25';
@@ -20,10 +21,10 @@ const EXPONENT_HYLOSOL = 'https://www.exponent.finance/liquidity/hylosol-10Dec25
 const EXPONENT_SHYUSD = 'https://www.exponent.finance/liquidity/shyusd-18Nov25';
 
 const RATEX_XSOL = 'https://app.rate-x.io/points?symbol=xSOL-2511';
-const RATEX_HYUSD = 'https://app.rate-x.io/points?symbol=hyUSD-2601';  // ← ИСПРАВЛЕНО
+const RATEX_HYUSD = 'https://app.rate-x.io/points?symbol=hyUSD-2601';
 const RATEX_HYLOSOL_PLUS = 'https://app.rate-x.io/points?symbol=hyloSOL%252B-2511';
 const RATEX_HYLOSOL = 'https://app.rate-x.io/points?symbol=hyloSOL-2511';
-const RATEX_SHYUSD = 'https://app.rate-x.io/points?symbol=sHYUSD-2601';  // ← ИСПРАВЛЕНО
+const RATEX_SHYUSD = 'https://app.rate-x.io/points?symbol=sHYUSD-2601';
 
 // === Labels ===
 const LABELS_EXPONENT = [
@@ -35,34 +36,45 @@ const LABELS_EXPONENT = [
 
 const LABELS_RATEX = [
   'xSOL-2511', 'PT-xSOL-2511', 'xSOL',
-  'hyUSD-2601', 'PT-hyUSD-2601', 'hyUSD',  // ← Добавлено 2601
-  'sHYUSD-2601', 'PT-sHYUSD-2601', 'sHYUSD',  // ← Добавлено 2601
+  'hyUSD-2601', 'PT-hyUSD-2601', 'hyUSD',
+  'sHYUSD-2601', 'PT-sHYUSD-2601', 'sHYUSD',
   'hyloSOL+-2511', 'PT-hyloSOL+-2511', 'hyloSOL+',
   'hyloSOL-2511', 'PT-hyloSOL-2511', 'hyloSOL',
-  'Total Combined APY', 'Fixed APY', 'Variable APY', 'Base APY', 'AMM APY'  // ← Улучшено
+  'Total Combined APY', 'Fixed APY', 'Variable APY', 'Base APY', 'AMM APY'
 ];
 
 // === Caching ===
 let cache = { ts: 0, data: null };
 const CACHE_TTL_MS = 60 * 1000;
 
-// === Shared Browser только для Exponent ===
+// === Shared Browser (только для Exponent) ===
 let sharedBrowser = null;
 async function getSharedBrowser() {
-  if (!sharedBrowser) {
-    sharedBrowser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-blink-features=AutomationControlled'
-      ],
-      defaultViewport: null
-    });
-    console.log('Puppeteer browser launched');
-  }
+  if (sharedBrowser) return sharedBrowser;
+
+  console.log('Puppeteer browser launching...');
+
+  // ЯВНЫЙ ПУТЬ К CHROME + ОПТИМИЗАЦИЯ ДЛЯ 512MB
+  sharedBrowser = await puppeteer.launch({
+    headless: true,
+    executablePath: '/opt/render/.cache/puppeteer/chrome/linux-141.0.7390.122/chrome-linux64/chrome',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--single-process',           // КРИТИЧНО ДЛЯ 512MB
+      '--disable-gpu',
+      '--no-zygote',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run'
+    ],
+    defaultViewport: null
+  });
+
+  console.log('Puppeteer browser launched');
   return sharedBrowser;
 }
 
@@ -70,7 +82,7 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// === УЛУЧШЕННЫЙ Поиск APY (с tokenHint внутри evaluate) ===
+// === Поиск APY ===
 async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = false) {
   return pRetry(async (attempt) => {
     console.log(`Fetch attempt ${attempt} for ${siteKey}: ${url}`);
@@ -78,8 +90,17 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
     let page;
 
     if (isRateX) {
-      // Для Rate-X: новый изолированный browser/page (избежать кэша)
-      browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+      browser = await puppeteer.launch({
+        headless: true,
+        executablePath: '/opt/render/.cache/puppeteer/chrome/linux-141.0.7390.122/chrome-linux64/chrome',
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--single-process',
+          '--disable-gpu',
+          '--disable-dev-shm-usage'
+        ]
+      });
       page = await browser.newPage();
     } else {
       browser = await getSharedBrowser();
@@ -98,7 +119,6 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
     try {
       await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
 
-      // УЛУЧШЕНО: Ожидание конкретных селекторов для Rate-X
       if (isRateX) {
         await Promise.race([
           page.waitForSelector('text/Fixed APY, text/Total Combined APY', { timeout: 15000 }).catch(() => {}),
@@ -118,17 +138,16 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
         ]);
       }
 
-      await sleep(2000);  // Уменьшено до 2s
+      await sleep(2000);
       const pageText = await page.evaluate(() => document.body.innerText);
 
       const found = await page.evaluate((labels, tokenHint) => {
         const results = {};
 
-        // УЛУЧШЕНО: Regex без обязательного пробела
         function extractPercent(text) {
           if (!text) return null;
           const match = text.match(/(-?[\d,]+(?:\.\d+)?)\s*%/) ||
-                        text.match(/(-?[\d,]+(?:\.\d+)?)%/);  // ← Без \s*
+                        text.match(/(-?[\d,]+(?:\.\d+)?)%/);
           if (!match) return null;
           const num = parseFloat(match[1].replace(/,/g, ''));
           if (isNaN(num)) return null;
@@ -136,7 +155,6 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
           return num;
         }
 
-        // УЛУЧШЕНО: Поиск по всем элементам + siblings + explicit для Rate-X
         const elements = Array.from(document.querySelectorAll('body *'))
           .filter(el => el.innerText && el.innerText.length < 1000);
 
@@ -144,7 +162,6 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
           const text = el.innerText;
           const lowerText = text.toLowerCase();
 
-          // Explicit поиск Fixed/Total Combined (для Rate-X)
           if (lowerText.includes('fixed apy') || lowerText.includes('total combined apy')) {
             const percent = extractPercent(text);
             if (percent !== null) {
@@ -165,7 +182,6 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
                 continue;
               }
 
-              // Siblings
               const parent = el.parentElement;
               if (parent) {
                 const siblings = Array.from(parent.children);
@@ -182,7 +198,6 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
           }
         }
 
-        // Fallback: Глобальный поиск APY
         if (Object.keys(results).length === 0) {
           const text = document.body.innerText;
           const apyMatches = [...text.matchAll(/(?:APY|Total Combined).*?(-?[\d,]+(?:\.\d+)?)\s*%?/gi)] || 
@@ -201,13 +216,10 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
         }
 
         return results;
-      }, labels, tokenHint);  // ← tokenHint теперь используется внутри
+      }, labels, tokenHint);
 
-      // УЛУЧШЕНО: mapLabel с tokenHint (теперь внутри, но для простоты снаружи; интегрировано)
       const mapLabel = (label, tokenHint) => {
         const l = label.toLowerCase();
-
-        // Приоритет: Explicit для Rate-X
         if (l.includes('fixed apy')) {
           const map = {
             'xSOL': 'PT-xSOL',
@@ -216,9 +228,8 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
             'hyloSOL+': 'PT-hyloSOL+',
             'hyloSOL': 'PT-hyloSOL'
           };
-          return map[tokenHint] || 'PT-' + tokenHint.toUpperCase();  // Fallback
+          return map[tokenHint] || 'PT-' + tokenHint.toUpperCase();
         }
-
         if (l.includes('total combined apy') || l.includes('variable apy')) {
           const map = {
             'xSOL': 'xSOL',
@@ -229,8 +240,6 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
           };
           return map[tokenHint] || tokenHint.toUpperCase();
         }
-
-        // Fallback по тексту
         if (l.includes('pt') && l.includes('xsol')) return 'PT-xSOL';
         if (l.includes('pt') && l.includes('hyusd') && !l.includes('shyusd')) return 'PT-hyUSD';
         if (l.includes('pt') && l.includes('shyusd')) return 'PT-sHYUSD';
@@ -241,14 +250,13 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
         if (l.includes('shyusd') && !l.includes('pt')) return 'sHYUSD';
         if (l.includes('hylosol') && l.includes('+') && !l.includes('pt')) return 'hyloSOL+';
         if (l.includes('hylosol') && !l.includes('+') && !l.includes('pt')) return 'hyloSOL';
-
         return null;
       };
 
       const normalized = {
         'PT-xSOL': null, 'xSOL': null,
         'PT-hyUSD': null, 'hyUSD': null,
-        'PT-sHYUSD': null, 'sHYUSD': null,  // ← Добавлено
+        'PT-sHYUSD': null, 'sHYUSD': null,
         'PT-hyloSOL+': null, 'hyloSOL+': null,
         'PT-hyloSOL': null, 'hyloSOL': null
       };
@@ -260,12 +268,11 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
         }
       }
 
-      // ← Лог только ненулевые
       const nonNull = Object.fromEntries(Object.entries(normalized).filter(([_, v]) => v !== null));
       console.log(`Parsed ${siteKey} (${tokenHint}):`, nonNull);
 
       await page.close();
-      if (isRateX) await browser.close();  // Закрыть изолированный
+      if (isRateX) await browser.close();
       return { ok: true, data: normalized, textSnippet: pageText.slice(0, 2000) };
 
     } catch (err) {
@@ -276,7 +283,7 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
         } catch (e) {}
       }
       try { await page.close(); if (isRateX) await browser.close(); } catch (e) {}
-      throw new pRetry.AbortError(err);  // Для retry
+      throw new pRetry.AbortError(err);
     }
   }, { retries: 2 });
 }
@@ -288,10 +295,9 @@ app.get('/api/apy', async (req, res) => {
     const force = req.query.force === '1';
 
     if (!force && cache.data && (now - cache.ts) < CACHE_TTL_MS) {
-      return res.json({ ok: true, source: 'cache', data: cache.data, cached_at: cache.ts });
+      return res.json({ ok: true, source: 'cache', data: cache.data, cached_at: new Date(cache.ts).toISOString() });
     }
 
-    // Exponent (shared, parallel)
     const expPromises = [
       fetchApysFromPage(EXPONENT_XSOL_1, LABELS_EXPONENT, 'exponent-xsol-1', 'xSOL', false),
       fetchApysFromPage(EXPONENT_XSOL_2, LABELS_EXPONENT, 'exponent-xsol-2', 'xSOL', false),
@@ -302,7 +308,6 @@ app.get('/api/apy', async (req, res) => {
     ];
     const [expXsol1, expXsol2, expHyusd, expHylosolPlus, expHylosol, expSHYUSD] = await Promise.all(expPromises);
 
-    // Rate-X (sequential to avoid OOM)
     const ratexPromises = [
       { url: RATEX_XSOL, key: 'ratex-xsol', hint: 'xSOL' },
       { url: RATEX_HYUSD, key: 'ratex-hyusd', hint: 'hyUSD' },
@@ -320,7 +325,6 @@ app.get('/api/apy', async (req, res) => {
     const get = (res, key) => res.ok && res.data[key] ? res.data[key].percent : null;
 
     const data = {
-      // Exponent
       exponent_xSOL_1: get(expXsol1, 'xSOL'),
       exponent_PT_xSOL_1: get(expXsol1, 'PT-xSOL'),
       exponent_xSOL_2: get(expXsol2, 'xSOL'),
@@ -329,25 +333,16 @@ app.get('/api/apy', async (req, res) => {
       exponent_PT_hyUSD: get(expHyusd, 'PT-hyUSD'),
       exponent_hylosolplus: get(expHylosolPlus, 'PT-hyloSOL+'),
       exponent_hylosol: get(expHylosol, 'PT-hyloSOL'),
-      exponent_sHYUSD: get(expSHYUSD, 'sHYUSD'),  // ← Fix: no space
+      exponent_sHYUSD: get(expSHYUSD, 'sHYUSD'),
 
-      // Rate-X: xSOL
       ratex_xSOL: get(ratexXsol, 'xSOL'),
       ratex_PT_xSOL: get(ratexXsol, 'PT-xSOL'),
-
-      // Rate-X: hyUSD (теперь правильно)
       ratex_hyUSD: get(ratexHyusd, 'hyUSD'),
       ratex_PT_hyUSD: get(ratexHyusd, 'PT-hyUSD'),
-
-      // Rate-X: hyloSOL+
       ratex_hylosolplus: get(ratexHylosolPlus, 'hyloSOL+'),
       ratex_PT_hylosolplus: get(ratexHylosolPlus, 'PT-hyloSOL+'),
-
-      // Rate-X: hyloSOL
       ratex_hylosol: get(ratexHylosol, 'hyloSOL'),
       ratex_PT_hylosol: get(ratexHylosol, 'PT-hyloSOL'),
-
-      // Rate-X: sHYUSD (теперь правильно)
       ratex_sHYUSD: get(ratexSHyusd, 'sHYUSD'),
       ratex_PT_sHYUSD: get(ratexSHyusd, 'PT-sHYUSD'),
 
@@ -366,7 +361,7 @@ app.get('/api/apy', async (req, res) => {
 // === /api/calc ===
 app.post('/api/calc', (req, res) => {
   try {
-    const { principal, rate, rateType = 'APY', days, compoundingPerYear = 365 } = req.body;  // ← APY по умолчанию
+    const { principal, rate, rateType = 'APY', days, compoundingPerYear = 365 } = req.body;
     const P = Number(principal || 0);
     const r = Number(rate || 0) / 100;
     const d = Number(days || 0);
@@ -376,7 +371,7 @@ app.post('/api/calc', (req, res) => {
 
     let final = 0;
     if (rateType.toUpperCase() === 'APY') {
-      final = P * Math.pow(1 + r, d / 365);  // ← Для APY: direct compound
+      final = P * Math.pow(1 + r, d / 365);
     } else {
       const apy = Math.pow(1 + r / n, n) - 1;
       final = P * Math.pow(1 + apy, d / 365);
@@ -402,4 +397,4 @@ process.on('SIGINT', async () => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Backend running on http://localhost:${PORT}`));
