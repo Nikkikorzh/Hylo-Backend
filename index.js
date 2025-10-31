@@ -89,9 +89,8 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
     let page;
 
     if (isRateX) {
-  browser = await puppeteer.launch({
+    browser = await puppeteer.launch({
     headless: true,
-    // УБРАЛ executablePath
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -100,6 +99,9 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
       '--disable-dev-shm-usage'
     ]
   });
+  page = await browser.newPage();  // ← ДОБАВЛЕНО!
+} else {
+  browser = await getSharedBrowser();
   page = await browser.newPage();
 }
 
