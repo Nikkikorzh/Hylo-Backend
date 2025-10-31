@@ -2,8 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import pRetry from 'p-retry';
-import puppeteer from 'puppeteer-core'; // <-- CORE!
-import chromium from '@sparticuz/chromium'; // <-- НОВОЕ: Chrome для Render
+import puppeteer from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 
 dotenv.config();
 
@@ -56,17 +56,15 @@ async function getSharedBrowser() {
   console.log('Puppeteer browser launching...');
 
   sharedBrowser = await puppeteer.launch({
-    args: chromium.args,
-    defaultViewport: chromium.defaultViewport,
-    executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
-    // Дополнительные флаги для обхода детекции
     args: [
       ...chromium.args,
       '--disable-web-security',
       '--disable-features=IsolateOrigins,site-per-process',
       '--disable-blink-features=AutomationControlled',
     ],
+    defaultViewport: chromium.defaultViewport,
+    executablePath: await chromium.executablePath(),
+    headless: chromium.headless,
   });
 
   console.log('Puppeteer browser launched');
@@ -80,204 +78,216 @@ function sleep(ms) {
 
 // === Поиск APY ===
 async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = false) {
-  return pRetry(async (attempt) => {
-    console.log(`Fetch attempt ${attempt} for ${siteKey}: ${url}`);
-    let browser;
-    let page;
+  return pRetry(
+    async (attempt) => {
+      console.log(`Fetch attempt ${attempt} for ${siteKey}: ${url}`);
+      let browser = null;
+      let page = null;
 
-    try {
-      if (isRateX) {
-        // Отдельный браузер для RateX
-        browser = await puppeteer.launch({
-          args: chromium.args,
-          defaultViewport: chromium.defaultViewport,
-          executablePath: await chromium.executablePath(),
-          headless: chromium.headless,
-        });
-      } else {
-        // Используем общий для Exponent
-        browser = await getSharedBrowser();
-      }
-      page = await browser.newPage();
-
-      await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        window.chrome = { runtime: {} };
-      });
-
-      await page.setUserAgent(
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      );
-
-      await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
-
-      if (isRateX) {
-        await Promise.race([
-          page.waitForSelector('text/Fixed APY, text/Total Combined APY', { timeout: 15000 }).catch(() => {}),
-          page.waitForFunction(() => document.body.innerText.includes('Fixed APY') || document.body.innerText.includes('Total Combined APY'), { timeout: 15000 }).catch(() => {})
-        ]);
-      } else {
-        await Promise.race([
-          page.waitForSelector('text/APY, text/%', { timeout: 10000 }).catch(() => {}),
-          page.waitForFunction(
-            (labels) => {
-              const text = document.body.innerText.toLowerCase();
-              return /apy|%/.test(text) || labels.some(l => text.includes(l.toLowerCase()));
-            },
-            { timeout: 10000 },
-            labels
-          ).catch(() => {})
-        ]);
-      }
-
-      await sleep(2000);
-      const pageText = await page.evaluate(() => document.body.innerText);
-
-      const found = await page.evaluate((labels, tokenHint) => {
-        const results = {};
-
-        function extractPercent(text) {
-          if (!text) return null;
-          const match = text.match(/(-?[\d,]+(?:\.\d+)?)\s*%/) ||
-                        text.match(/(-?[\d,]+(?:\.\d+)?)%/);
-          if (!match) return null;
-          const num = parseFloat(match[1].replace(/,/g, ''));
-          if (isNaN(num)) return null;
-          if (num === 100 && !text.toLowerCase().includes('apy')) return null;
-          return num;
+      try {
+        // Выбор браузера
+        if (isRateX) {
+          browser = await puppeteer.launch({
+            args: chromium.args,
+            defaultViewport: chromium.defaultViewport,
+            executablePath: await chromium.executablePath(),
+            headless: chromium.headless,
+          });
+        } else {
+          browser = await getSharedBrowser();
         }
 
-        const elements = Array.from(document.querySelectorAll('body *'))
-          .filter(el => el.innerText && el.innerText.length < 1000);
+        page = await browser.newPage();
 
-        for (const el of elements) {
-          const text = el.innerText;
-          const lowerText = text.toLowerCase();
+        // Обход детекции
+        await page.evaluateOnNewDocument(() => {
+          Object.defineProperty(navigator, 'webdriver', { get: () => false });
+          window.chrome = { runtime: {} };
+        });
 
-          if (lowerText.includes('fixed apy') || lowerText.includes('total combined apy')) {
-            const percent = extractPercent(text);
-            if (percent !== null) {
-              let key = lowerText.includes('fixed') ? 'Fixed APY' : 'Total Combined APY';
-              if (!results[key]) {
-                results[key] = { percent, context: text.slice(0, 400), source: 'explicit' };
-              }
-              continue;
-            }
+        await page.setUserAgent(
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        );
+
+        await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
+
+        // Ожидание контента
+        if (isRateX) {
+          await Promise.race([
+            page.waitForSelector('text/Fixed APY, text/Total Combined APY', { timeout: 15000 }).catch(() => {}),
+            page.waitForFunction(
+              () => document.body.innerText.includes('Fixed APY') || document.body.innerText.includes('Total Combined APY'),
+              { timeout: 15000 }
+            ).catch(() => {})
+          ]);
+        } else {
+          await Promise.race([
+            page.waitForSelector('text/APY, text/%', { timeout: 10000 }).catch(() => {}),
+            page.waitForFunction(
+              (labels) => {
+                const text = document.body.innerText.toLowerCase();
+                return /apy|%/.test(text) || labels.some(l => text.includes(l.toLowerCase()));
+              },
+              { timeout: 10000 },
+              labels
+            ).catch(() => {})
+          ]);
+        }
+
+        await sleep(2000);
+        const pageText = await page.evaluate(() => document.body.innerText);
+
+        // === Парсинг APY ===
+        const found = await page.evaluate((labels, tokenHint) => {
+          const results = {};
+
+          function extractPercent(text) {
+            if (!text) return null;
+            const match = text.match(/(-?[\d,]+(?:\.\d+)?)\s*%/) ||
+                          text.match(/(-?[\d,]+(?:\.\d+)?)%/);
+            if (!match) return null;
+            const num = parseFloat(match[1].replace(/,/g, ''));
+            if (isNaN(num)) return null;
+            if (num === 100 && !text.toLowerCase().includes('apy')) return null;
+            return num;
           }
 
-          for (const label of labels) {
-            const labelLower = label.toLowerCase();
-            if (lowerText.includes(labelLower) && !results[label]) {
+          const elements = Array.from(document.querySelectorAll('body *'))
+            .filter(el => el.innerText && el.innerText.length < 1000);
+
+          for (const el of elements) {
+            const text = el.innerText;
+            const lowerText = text.toLowerCase();
+
+            if (lowerText.includes('fixed apy') || lowerText.includes('total combined apy')) {
               const percent = extractPercent(text);
               if (percent !== null) {
-                results[label] = { percent, context: text.slice(0, 400), source: 'same-element' };
+                let key = lowerText.includes('fixed') ? 'Fixed APY' : 'Total Combined APY';
+                if (!results[key]) {
+                  results[key] = { percent, context: text.slice(0, 400), source: 'explicit' };
+                }
                 continue;
               }
+            }
 
-              const parent = el.parentElement;
-              if (parent) {
-                const siblings = Array.from(parent.children);
-                for (const sib of siblings) {
-                  if (sib === el) continue;
-                  const p = extractPercent(sib.innerText);
-                  if (p !== null) {
-                    results[label] = { percent: p, context: sib.innerText.slice(0, 400), source: 'sibling' };
-                    break;
+            for (const label of labels) {
+              const labelLower = label.toLowerCase();
+              if (lowerText.includes(labelLower) && !results[label]) {
+                const percent = extractPercent(text);
+                if (percent !== null) {
+                  results[label] = { percent, context: text.slice(0, 400), source: 'same-element' };
+                  continue;
+                }
+
+                const parent = el.parentElement;
+                if (parent) {
+                  const siblings = Array.from(parent.children);
+                  for (const sib of siblings) {
+                    if (sib === el) continue;
+                    const p = extractPercent(sib.innerText);
+                    if (p !== null) {
+                      results[label] = { percent: p, context: sib.innerText.slice(0, 400), source: 'sibling' };
+                      break;
+                    }
                   }
                 }
               }
             }
           }
-        }
 
-        if (Object.keys(results).length === 0) {
-          const text = document.body.innerText;
-          const apyMatches = [...text.matchAll(/(?:APY|Total Combined).*?(-?[\d,]+(?:\.\d+)?)\s*%?/gi)] || 
-                            [...text.matchAll(/(-?[\d,]+(?:\.\d+)?)%/g)];
-          for (const m of apyMatches) {
-            const window = m[0].toLowerCase();
-            for (const label of labels) {
-              if (!results[label] && window.includes(label.toLowerCase())) {
-                const num = parseFloat(m[1]?.replace(/,/g, '') || m[0].match(/[\d.]+/)[0]);
-                if (!isNaN(num)) {
-                  results[label] = { percent: num, context: window, source: 'APY-block' };
+          if (Object.keys(results).length === 0) {
+            const text = document.body.innerText;
+            const apyMatches = [...text.matchAll(/(?:APY|Total Combined).*?(-?[\d,]+(?:\.\d+)?)\s*%?/gi)] ||
+                              [...text.matchAll(/(-?[\d,]+(?:\.\d+)?)%/g)];
+            for (const m of apyMatches) {
+              const window = m[0].toLowerCase();
+              for (const label of labels) {
+                if (!results[label] && window.includes(label.toLowerCase())) {
+                  const num = parseFloat(m[1]?.replace(/,/g, '') || m[0].match(/[\d.]+/)[0]);
+                  if (!isNaN(num)) {
+                    results[label] = { percent: num, context: window, source: 'APY-block' };
+                  }
                 }
               }
             }
           }
+
+          return results;
+        }, labels, tokenHint);
+
+        // === Маппинг меток ===
+        const mapLabel = (label, tokenHint) => {
+          const l = label.toLowerCase();
+          if (l.includes('fixed apy')) {
+            const map = { 'xSOL': 'PT-xSOL', 'hyUSD': 'PT-hyUSD', 'sHYUSD': 'PT-sHYUSD', 'hyloSOL+': 'PT-hyloSOL+', 'hyloSOL': 'PT-hyloSOL' };
+            return map[tokenHint] || 'PT-' + tokenHint.toUpperCase();
+          }
+          if (l.includes('total combined apy') || l.includes('variable apy')) {
+            const map = { 'xSOL': 'xSOL', 'hyUSD': 'hyUSD', 'sHYUSD': 'sHYUSD', 'hyloSOL+': 'hyloSOL+', 'hyloSOL': 'hyloSOL' };
+            return map[tokenHint] || tokenHint.toUpperCase();
+          }
+          if (l.includes('pt') && l.includes('xsol')) return 'PT-xSOL';
+          if (l.includes('pt') && l.includes('hyusd') && !l.includes('shyusd')) return 'PT-hyUSD';
+          if (l.includes('pt') && l.includes('shyusd')) return 'PT-sHYUSD';
+          if (l.includes('pt') && l.includes('hylosol') && l.includes('+')) return 'PT-hyloSOL+';
+          if (l.includes('pt') && l.includes('hylosol') && !l.includes('+')) return 'PT-hyloSOL';
+          if (l.includes('xsol') && !l.includes('pt')) return 'xSOL';
+          if (l.includes('hyusd') && !l.includes('pt') && !l.includes('shyusd')) return 'hyUSD';
+          if (l.includes('shyusd') && !l.includes('pt')) return 'sHYUSD';
+          if (l.includes('hylosol') && l.includes('+') && !l.includes('pt')) return 'hyloSOL+';
+          if (l.includes('hylosol') && !l.includes('+') && !l.includes('pt')) return 'hyloSOL';
+          return null;
+        };
+
+        const normalized = {
+          'PT-xSOL': null, 'xSOL': null,
+          'PT-hyUSD': null, 'hyUSD': null,
+          'PT-sHYUSD': null, 'sHYUSD': null,
+          'PT-hyloSOL+': null, 'hyloSOL+': null,
+          'PT-hyloSOL': null, 'hyloSOL': null
+        };
+
+        for (const [key, val] of Object.entries(found)) {
+          const mapped = mapLabel(key, tokenHint);
+          if (mapped && !normalized[mapped]) {
+            normalized[mapped] = val;
+          }
         }
 
-        return results;
-      }, labels, tokenHint);
+        const nonNull = Object.fromEntries(Object.entries(normalized).filter(([_, v]) => v !== null));
+        console.log(`Parsed ${siteKey} (${tokenHint}):`, nonNull);
 
-      const mapLabel = (label, tokenHint) => {
-        const l = label.toLowerCase();
-        if (l.includes('fixed apy')) {
-          const map = {
-            'xSOL': 'PT-xSOL',
-            'hyUSD': 'PT-hyUSD',
-            'sHYUSD': 'PT-sHYUSD',
-            'hyloSOL+': 'PT-hyloSOL+',
-            'hyloSOL': 'PT-hyloSOL'
-          };
-          return map[tokenHint] || 'PT-' + tokenHint.toUpperCase();
-        }
-        if (l.includes('total combined apy') || l.includes('variable apy')) {
-          const map = {
-            'xSOL': 'xSOL',
-            'hyUSD': 'hyUSD',
-            'sHYUSD': 'sHYUSD',
-            'hyloSOL+': 'hyloSOL+',
-            'hyloSOL': 'hyloSOL'
-          };
-          return map[tokenHint] || tokenHint.toUpperCase();
-        }
-        if (l.includes('pt') && l.includes('xsol')) return 'PT-xSOL';
-        if (l.includes('pt') && l.includes('hyusd') && !l.includes('shyusd')) return 'PT-hyUSD';
-        if (l.includes('pt') && l.includes('shyusd')) return 'PT-sHYUSD';
-        if (l.includes('pt') && l.includes('hylosol') && l.includes('+')) return 'PT-hyloSOL+';
-        if (l.includes('pt') && l.includes('hylosol') && !l.includes('+')) return 'PT-hyloSOL';
-        if (l.includes('xsol') && !l.includes('pt')) return 'xSOL';
-        if (l.includes('hyusd') && !l.includes('pt') && !l.includes('shyusd')) return 'hyUSD';
-        if (l.includes('shyusd') && !l.includes('pt')) return 'sHYUSD';
-        if (l.includes('hylosol') && l.includes('+') && !l.includes('pt')) return 'hyloSOL+';
-        if (l.includes('hylosol') && !l.includes('+') && !l.includes('pt')) return 'hyloSOL';
-        return null;
-      };
+        await page.close();
+        if (isRateX) await browser.close();
 
-      const normalized = {
-        'PT-xSOL': null, 'xSOL': null,
-        'PT-hyUSD': null, 'hyUSD': null,
-        'PT-sHYUSD': null, 'sHYUSD': null,
-        'PT-hyloSOL+': null, 'hyloSOL+': null,
-        'PT-hyloSOL': null, 'hyloSOL': null
-      };
+        return { ok: true, data: normalized, textSnippet: pageText.slice(0, 2000) };
 
-      for (const [key, val] of Object.entries(found)) {
-        const mapped = mapLabel(key, tokenHint);
-        if (mapped && !normalized[mapped]) {
-          normalized[mapped] = val;
+      } catch (err) {
+        // === Ошибка: логируем, сохраняем скриншот (dev), закрываем ===
+        if (NODE_ENV !== 'production') {
+          try {
+            await page?.screenshot({ path: `debug-${siteKey}.png`, fullPage: true });
+            console.log(`Screenshot saved: debug-${siteKey}.png`);
+          } catch (e) {}
         }
+
+        try { await page?.close(); if (isRateX) await browser?.close(); } catch (e) {}
+
+        // Просто бросаем ошибку — p-retry решит, повторять или нет
+        throw err;
       }
-
-      const nonNull = Object.fromEntries(Object.entries(normalized).filter(([_, v]) => v !== null));
-      console.log(`Parsed ${siteKey} (${tokenHint}):`, nonNull);
-
-      await page.close();
-      if (isRateX) await browser.close();
-      return { ok: true, data: normalized, textSnippet: pageText.slice(0, 2000) };
-
-    } catch (err) {
-      if (NODE_ENV !== 'production') {
-        try {
-          await page.screenshot({ path: `debug-${siteKey}.png`, fullPage: true });
-          console.log(`Screenshot saved: debug-${siteKey}.png`);
-        } catch (e) {}
-      }
-      try { await page.close(); if (isRateX) await browser.close(); } catch (e) {}
-      throw new pRetry.AbortError(err);
+    },
+    {
+      retries: 2,
+      onFailedAttempt: (failure) => {
+        console.warn(`Attempt ${failure.attemptNumber} failed for ${siteKey}:`, failure.error.message);
+        // После 2-й ошибки — прерываем (не делаем 3-ю попытку)
+        if (failure.attemptNumber >= 2) {
+          throw failure.error;
+        }
+      },
     }
-  }, { retries: 2 });
+  );
 }
 
 // === API: /api/apy ===
@@ -298,6 +308,7 @@ app.get('/api/apy', async (req, res) => {
       fetchApysFromPage(EXPONENT_HYLOSOL, LABELS_EXPONENT, 'exponent-hylosol', 'hyloSOL', false),
       fetchApysFromPage(EXPONENT_SHYUSD, LABELS_EXPONENT, 'exponent-shyusd', 'sHYUSD', false),
     ];
+
     const [expXsol1, expXsol2, expHyusd, expHylosolPlus, expHylosol, expSHYUSD] = await Promise.all(expPromises);
 
     const ratexPromises = [
@@ -307,11 +318,13 @@ app.get('/api/apy', async (req, res) => {
       { url: RATEX_HYLOSOL, key: 'ratex-hylosol', hint: 'hyloSOL' },
       { url: RATEX_SHYUSD, key: 'ratex-shyusd', hint: 'sHYUSD' }
     ];
-    const ratexResults = [];
-    for (const { url, key, hint } of ratexPromises) {
-      const result = await fetchApysFromPage(url, LABELS_RATEX, key, hint, true);
-      ratexResults.push(result);
-    }
+
+    const ratexResults = await Promise.all(
+      ratexPromises.map(({ url, key, hint }) =>
+        fetchApysFromPage(url, LABELS_RATEX, key, hint, true)
+      )
+    );
+
     const [ratexXsol, ratexHyusd, ratexHylosolPlus, ratexHylosol, ratexSHyusd] = ratexResults;
 
     const get = (res, key) => res.ok && res.data[key] ? res.data[key].percent : null;
