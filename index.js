@@ -50,24 +50,39 @@ const CACHE_TTL_MS = 60 * 1000;
 
 // === Shared Browser (только для Exponent) ===
 let sharedBrowser = null;
+let isLaunching = false;
+
 async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
 
+  if (isLaunching) {
+    while (!sharedBrowser) await new Promise(r => setTimeout(r, 100));
+    return sharedBrowser;
+  }
+
+  isLaunching = true;
   console.log('Puppeteer browser launching...');
 
-  sharedBrowser = await puppeteer.launch({
-    args: [
-      ...chromium.args,
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--disable-blink-features=AutomationControlled',
-    ],
-    defaultViewport: chromium.defaultViewport,
-    executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
-  });
+  try {
+    sharedBrowser = await puppeteer.launch({
+      args: [
+        ...chromium.args,
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-blink-features=AutomationControlled',
+      ],
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
+    console.log('Puppeteer browser launched');
+  } catch (err) {
+    console.error('Failed to launch browser:', err);
+    throw err;
+  } finally {
+    isLaunching = false;
+  }
 
-  console.log('Puppeteer browser launched');
   return sharedBrowser;
 }
 
@@ -76,7 +91,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// === Поиск APY ===
+// === Поиск APY (БЕЗОПАСНЫЙ RETRY) ===
 async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = false) {
   return pRetry(
     async (attempt) => {
@@ -85,7 +100,7 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
       let page = null;
 
       try {
-        // Выбор браузера
+        // === Браузер ===
         if (isRateX) {
           browser = await puppeteer.launch({
             args: chromium.args,
@@ -109,20 +124,19 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         );
 
-        await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
+        // Быстрее: domcontentloaded
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Ожидание контента
+        // Ожидание APY
         if (isRateX) {
           await Promise.race([
-            page.waitForSelector('text/Fixed APY, text/Total Combined APY', { timeout: 15000 }).catch(() => {}),
             page.waitForFunction(
               () => document.body.innerText.includes('Fixed APY') || document.body.innerText.includes('Total Combined APY'),
-              { timeout: 15000 }
-            ).catch(() => {})
+              { timeout: 10000 }
+            ).catch(() => {}),
           ]);
         } else {
           await Promise.race([
-            page.waitForSelector('text/APY, text/%', { timeout: 10000 }).catch(() => {}),
             page.waitForFunction(
               (labels) => {
                 const text = document.body.innerText.toLowerCase();
@@ -130,14 +144,14 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
               },
               { timeout: 10000 },
               labels
-            ).catch(() => {})
+            ).catch(() => {}),
           ]);
         }
 
-        await sleep(2000);
+        await sleep(1500);
         const pageText = await page.evaluate(() => document.body.innerText);
 
-        // === Парсинг APY ===
+        // === Парсинг ===
         const found = await page.evaluate((labels, tokenHint) => {
           const results = {};
 
@@ -215,7 +229,7 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
           return results;
         }, labels, tokenHint);
 
-        // === Маппинг меток ===
+        // === Маппинг ===
         const mapLabel = (label, tokenHint) => {
           const l = label.toLowerCase();
           if (l.includes('fixed apy')) {
@@ -263,7 +277,6 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
         return { ok: true, data: normalized, textSnippet: pageText.slice(0, 2000) };
 
       } catch (err) {
-        // === Ошибка: логируем, сохраняем скриншот (dev), закрываем ===
         if (NODE_ENV !== 'production') {
           try {
             await page?.screenshot({ path: `debug-${siteKey}.png`, fullPage: true });
@@ -273,24 +286,25 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
 
         try { await page?.close(); if (isRateX) await browser?.close(); } catch (e) {}
 
-        // Просто бросаем ошибку — p-retry решит, повторять или нет
         throw err;
       }
     },
     {
       retries: 2,
       onFailedAttempt: (failure) => {
-        console.warn(`Attempt ${failure.attemptNumber} failed for ${siteKey}:`, failure.error.message);
-        // После 2-й ошибки — прерываем (не делаем 3-ю попытку)
+        const errorMessage = failure.error?.message || 'Unknown error';
+        console.warn(`Attempt ${failure.attemptNumber} failed for ${siteKey}:`, errorMessage);
+
         if (failure.attemptNumber >= 2) {
-          throw failure.error;
+          const finalError = failure.error || new Error(`Failed after ${failure.attemptNumber} attempts`);
+          throw finalError;
         }
       },
     }
   );
 }
 
-// === API: /api/apy ===
+// === API: /api/apy (ПОСЛЕДОВАТЕЛЬНЫЙ + БЕЗОПАСНЫЙ) ===
 app.get('/api/apy', async (req, res) => {
   try {
     const now = Date.now();
@@ -300,66 +314,82 @@ app.get('/api/apy', async (req, res) => {
       return res.json({ ok: true, source: 'cache', data: cache.data, cached_at: new Date(cache.ts).toISOString() });
     }
 
-    const expPromises = [
-      fetchApysFromPage(EXPONENT_XSOL_1, LABELS_EXPONENT, 'exponent-xsol-1', 'xSOL', false),
-      fetchApysFromPage(EXPONENT_XSOL_2, LABELS_EXPONENT, 'exponent-xsol-2', 'xSOL', false),
-      fetchApysFromPage(EXPONENT_HYUSD, LABELS_EXPONENT, 'exponent-hyusd', 'hyUSD', false),
-      fetchApysFromPage(EXPONENT_HYLOSOL_PLUS, LABELS_EXPONENT, 'exponent-hylosolplus', 'hyloSOL+', false),
-      fetchApysFromPage(EXPONENT_HYLOSOL, LABELS_EXPONENT, 'exponent-hylosol', 'hyloSOL', false),
-      fetchApysFromPage(EXPONENT_SHYUSD, LABELS_EXPONENT, 'exponent-shyusd', 'sHYUSD', false),
+    const results = {};
+
+    // === Exponent: ПОСЛЕДОВАТЕЛЬНО ===
+    const expTasks = [
+      { key: 'exponent-xsol-1', url: EXPONENT_XSOL_1, hint: 'xSOL' },
+      { key: 'exponent-xsol-2', url: EXPONENT_XSOL_2, hint: 'xSOL' },
+      { key: 'exponent-hyusd', url: EXPONENT_HYUSD, hint: 'hyUSD' },
+      { key: 'exponent-hylosolplus', url: EXPONENT_HYLOSOL_PLUS, hint: 'hyloSOL+' },
+      { key: 'exponent-hylosol', url: EXPONENT_HYLOSOL, hint: 'hyloSOL' },
+      { key: 'exponent-shyusd', url: EXPONENT_SHYUSD, hint: 'sHYUSD' },
     ];
 
-    const [expXsol1, expXsol2, expHyusd, expHylosolPlus, expHylosol, expSHYUSD] = await Promise.all(expPromises);
+    for (const task of expTasks) {
+      try {
+        const data = await fetchApysFromPage(task.url, LABELS_EXPONENT, task.key, task.hint, false);
+        results[task.key] = data.ok ? data.data : null;
+        console.log(`Success: ${task.key}`);
+      } catch (err) {
+        console.error(`Failed: ${task.key} — ${err.message}`);
+        results[task.key] = null;
+      }
+    }
 
-    const ratexPromises = [
-      { url: RATEX_XSOL, key: 'ratex-xsol', hint: 'xSOL' },
-      { url: RATEX_HYUSD, key: 'ratex-hyusd', hint: 'hyUSD' },
-      { url: RATEX_HYLOSOL_PLUS, key: 'ratex-hylosolplus', hint: 'hyloSOL+' },
-      { url: RATEX_HYLOSOL, key: 'ratex-hylosol', hint: 'hyloSOL' },
-      { url: RATEX_SHYUSD, key: 'ratex-shyusd', hint: 'sHYUSD' }
+    // === RateX: ПАРАЛЛЕЛЬНО ===
+    const ratexTasks = [
+      { key: 'ratex-xsol', url: RATEX_XSOL, hint: 'xSOL' },
+      { key: 'ratex-hyusd', url: RATEX_HYUSD, hint: 'hyUSD' },
+      { key: 'ratex-hylosolplus', url: RATEX_HYLOSOL_PLUS, hint: 'hyloSOL+' },
+      { key: 'ratex-hylosol', url: RATEX_HYLOSOL, hint: 'hyloSOL' },
+      { key: 'ratex-shyusd', url: RATEX_SHYUSD, hint: 'sHYUSD' },
     ];
 
-    const ratexResults = await Promise.all(
-      ratexPromises.map(({ url, key, hint }) =>
-        fetchApysFromPage(url, LABELS_RATEX, key, hint, true)
-      )
+    const ratexSettled = await Promise.allSettled(
+      ratexTasks.map(t => fetchApysFromPage(t.url, LABELS_RATEX, t.key, t.hint, true))
     );
 
-    const [ratexXsol, ratexHyusd, ratexHylosolPlus, ratexHylosol, ratexSHyusd] = ratexResults;
+    ratexTasks.forEach((t, i) => {
+      const res = ratexSettled[i];
+      results[t.key] = res.status === 'fulfilled' && res.value.ok ? res.value.data : null;
+    });
 
-    const get = (res, key) => res.ok && res.data[key] ? res.data[key].percent : null;
+    // === Формируем ответ ===
+    const get = (obj, key) => obj?.[key]?.percent ?? null;
 
     const data = {
-      exponent_xSOL_1: get(expXsol1, 'xSOL'),
-      exponent_PT_xSOL_1: get(expXsol1, 'PT-xSOL'),
-      exponent_xSOL_2: get(expXsol2, 'xSOL'),
-      exponent_PT_xSOL_2: get(expXsol2, 'PT-xSOL'),
-      exponent_hyUSD: get(expHyusd, 'hyUSD'),
-      exponent_PT_hyUSD: get(expHyusd, 'PT-hyUSD'),
-      exponent_hylosolplus: get(expHylosolPlus, 'PT-hyloSOL+'),
-      exponent_hylosol: get(expHylosol, 'PT-hyloSOL'),
-      exponent_sHYUSD: get(expSHYUSD, 'sHYUSD'),
+      exponent_xSOL_1: get(results['exponent-xsol-1'], 'xSOL'),
+      exponent_PT_xSOL_1: get(results['exponent-xsol-1'], 'PT-xSOL'),
+      exponent_xSOL_2: get(results['exponent-xsol-2'], 'xSOL'),
+      exponent_PT_xSOL_2: get(results['exponent-xsol-2'], 'PT-xSOL'),
+      exponent_hyUSD: get(results['exponent-hyusd'], 'hyUSD'),
+      exponent_PT_hyUSD: get(results['exponent-hyusd'], 'PT-hyUSD'),
+      exponent_hylosolplus: get(results['exponent-hylosolplus'], 'PT-hyloSOL+'),
+      exponent_hylosol: get(results['exponent-hylosol'], 'PT-hyloSOL'),
+      exponent_sHYUSD: get(results['exponent-shyusd'], 'sHYUSD'),
 
-      ratex_xSOL: get(ratexXsol, 'xSOL'),
-      ratex_PT_xSOL: get(ratexXsol, 'PT-xSOL'),
-      ratex_hyUSD: get(ratexHyusd, 'hyUSD'),
-      ratex_PT_hyUSD: get(ratexHyusd, 'PT-hyUSD'),
-      ratex_hylosolplus: get(ratexHylosolPlus, 'hyloSOL+'),
-      ratex_PT_hylosolplus: get(ratexHylosolPlus, 'PT-hyloSOL+'),
-      ratex_hylosol: get(ratexHylosol, 'hyloSOL'),
-      ratex_PT_hylosol: get(ratexHylosol, 'PT-hyloSOL'),
-      ratex_sHYUSD: get(ratexSHyusd, 'sHYUSD'),
-      ratex_PT_sHYUSD: get(ratexSHyusd, 'PT-sHYUSD'),
+      ratex_xSOL: get(results['ratex-xsol'], 'xSOL'),
+      ratex_PT_xSOL: get(results['ratex-xsol'], 'PT-xSOL'),
+      ratex_hyUSD: get(results['ratex-hyusd'], 'hyUSD'),
+      ratex_PT_hyUSD: get(results['ratex-hyusd'], 'PT-hyUSD'),
+      ratex_hylosolplus: get(results['ratex-hylosolplus'], 'hyloSOL+'),
+      ratex_PT_hylosolplus: get(results['ratex-hylosolplus'], 'PT-hyloSOL+'),
+      ratex_hylosol: get(results['ratex-hylosol'], 'hyloSOL'),
+      ratex_PT_hylosol: get(results['ratex-hylosol'], 'PT-hyloSOL'),
+      ratex_sHYUSD: get(results['ratex-shyusd'], 'sHYUSD'),
+      ratex_PT_sHYUSD: get(results['ratex-shyusd'], 'PT-sHYUSD'),
 
-      fetched_at: new Date().toISOString()
+      fetched_at: new Date().toISOString(),
+      partial: Object.values(results).some(v => v === null)
     };
 
     cache = { ts: now, data };
     res.json({ ok: true, source: 'live', data });
 
   } catch (e) {
-    console.error('API /api/apy error:', e);
-    res.status(500).json({ ok: false, error: e.message });
+    console.error('API /api/apy fatal error:', e);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
