@@ -1,0 +1,4 @@
+node_modules/
+.env
+dist/
+*.png  # debug-скрины от Puppeteer
