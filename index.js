@@ -48,21 +48,18 @@ const LABELS_RATEX = [
 let cache = { ts: 0, data: null };
 const CACHE_TTL_MS = 60 * 1000;
 
-// === Shared Browser (только для Exponent) ===
+// === Shared Browser ===
 let sharedBrowser = null;
 let isLaunching = false;
 
 async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
-
   if (isLaunching) {
     while (!sharedBrowser) await new Promise(r => setTimeout(r, 100));
     return sharedBrowser;
   }
-
   isLaunching = true;
   console.log('Puppeteer browser launching...');
-
   try {
     sharedBrowser = await puppeteer.launch({
       args: [
@@ -82,7 +79,6 @@ async function getSharedBrowser() {
   } finally {
     isLaunching = false;
   }
-
   return sharedBrowser;
 }
 
@@ -91,232 +87,235 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// === Поиск APY (БЕЗОПАСНЫЙ RETRY) ===
+// === Поиск APY с ТАЙМАУТОМ и ОГРАНИЧЕННЫМ RETRY ===
 async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = false) {
-  return pRetry(
-    async (attempt) => {
-      console.log(`Fetch attempt ${attempt} for ${siteKey}: ${url}`);
-      let browser = null;
-      let page = null;
+  const controller = new AbortController();
+  const globalTimeout = setTimeout(() => controller.abort(), 45000); // 45 сек на всё
 
-      try {
-        // === Браузер ===
-        if (isRateX) {
-          browser = await puppeteer.launch({
-            args: chromium.args,
-            defaultViewport: chromium.defaultViewport,
-            executablePath: await chromium.executablePath(),
-            headless: chromium.headless,
-          });
-        } else {
-          browser = await getSharedBrowser();
-        }
+  try {
+    return await pRetry(
+      async (attempt) => {
+        console.log(`Fetch attempt ${attempt} for ${siteKey}: ${url}`);
+        let browser = null;
+        let page = null;
 
-        page = await browser.newPage();
-
-        // Обход детекции
-        await page.evaluateOnNewDocument(() => {
-          Object.defineProperty(navigator, 'webdriver', { get: () => false });
-          window.chrome = { runtime: {} };
-        });
-
-        await page.setUserAgent(
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        );
-
-        // Быстрее: domcontentloaded
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        // Ожидание APY
-        if (isRateX) {
-          await Promise.race([
-            page.waitForFunction(
-              () => document.body.innerText.includes('Fixed APY') || document.body.innerText.includes('Total Combined APY'),
-              { timeout: 10000 }
-            ).catch(() => {}),
-          ]);
-        } else {
-          await Promise.race([
-            page.waitForFunction(
-              (labels) => {
-                const text = document.body.innerText.toLowerCase();
-                return /apy|%/.test(text) || labels.some(l => text.includes(l.toLowerCase()));
-              },
-              { timeout: 10000 },
-              labels
-            ).catch(() => {}),
-          ]);
-        }
-
-        await sleep(1500);
-        const pageText = await page.evaluate(() => document.body.innerText);
-
-        // === Парсинг ===
-        const found = await page.evaluate((labels, tokenHint) => {
-          const results = {};
-
-          function extractPercent(text) {
-            if (!text) return null;
-            const match = text.match(/(-?[\d,]+(?:\.\d+)?)\s*%/) ||
-                          text.match(/(-?[\d,]+(?:\.\d+)?)%/);
-            if (!match) return null;
-            const num = parseFloat(match[1].replace(/,/g, ''));
-            if (isNaN(num)) return null;
-            if (num === 100 && !text.toLowerCase().includes('apy')) return null;
-            return num;
+        try {
+          if (isRateX) {
+            browser = await puppeteer.launch({
+              args: chromium.args,
+              defaultViewport: chromium.defaultViewport,
+              executablePath: await chromium.executablePath(),
+              headless: chromium.headless,
+            });
+          } else {
+            browser = await getSharedBrowser();
           }
 
-          const elements = Array.from(document.querySelectorAll('body *'))
-            .filter(el => el.innerText && el.innerText.length < 1000);
+          page = await browser.newPage();
 
-          for (const el of elements) {
-            const text = el.innerText;
-            const lowerText = text.toLowerCase();
+          await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            window.chrome = { runtime: {} };
+          });
 
-            if (lowerText.includes('fixed apy') || lowerText.includes('total combined apy')) {
-              const percent = extractPercent(text);
-              if (percent !== null) {
-                let key = lowerText.includes('fixed') ? 'Fixed APY' : 'Total Combined APY';
-                if (!results[key]) {
-                  results[key] = { percent, context: text.slice(0, 400), source: 'explicit' };
-                }
-                continue;
-              }
+          await page.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          );
+
+          // ТАЙМАУТ НА GOTO
+          await page.goto(url, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+            signal: controller.signal
+          });
+
+          // Ожидание APY
+          if (isRateX) {
+            await Promise.race([
+              page.waitForFunction(
+                () => document.body.innerText.includes('Fixed APY') || document.body.innerText.includes('Total Combined APY'),
+                { timeout: 10000 }
+              ).catch(() => {}),
+            ]);
+          } else {
+            await Promise.race([
+              page.waitForFunction(
+                (labels) => {
+                  const text = document.body.innerText.toLowerCase();
+                  return /apy|%/.test(text) || labels.some(l => text.includes(l.toLowerCase()));
+                },
+                { timeout: 10000 },
+                labels
+              ).catch(() => {}),
+            ]);
+          }
+
+          await sleep(1500);
+          const pageText = await page.evaluate(() => document.body.innerText);
+
+          // === Парсинг (без изменений) ===
+          const found = await page.evaluate((labels, tokenHint) => {
+            const results = {};
+
+            function extractPercent(text) {
+              if (!text) return null;
+              const match = text.match(/(-?[\d,]+(?:\.\d+)?)\s*%/) ||
+                            text.match(/(-?[\d,]+(?:\.\d+)?)%/);
+              if (!match) return null;
+              const num = parseFloat(match[1].replace(/,/g, ''));
+              if (isNaN(num)) return null;
+              if (num === 100 && !text.toLowerCase().includes('apy')) return null;
+              return num;
             }
 
-            for (const label of labels) {
-              const labelLower = label.toLowerCase();
-              if (lowerText.includes(labelLower) && !results[label]) {
+            const elements = Array.from(document.querySelectorAll('body *'))
+              .filter(el => el.innerText && el.innerText.length < 1000);
+
+            for (const el of elements) {
+              const text = el.innerText;
+              const lowerText = text.toLowerCase();
+
+              if (lowerText.includes('fixed apy') || lowerText.includes('total combined apy')) {
                 const percent = extractPercent(text);
                 if (percent !== null) {
-                  results[label] = { percent, context: text.slice(0, 400), source: 'same-element' };
+                  let key = lowerText.includes('fixed') ? 'Fixed APY' : 'Total Combined APY';
+                  if (!results[key]) {
+                    results[key] = { percent, context: text.slice(0, 400), source: 'explicit' };
+                  }
                   continue;
                 }
+              }
 
-                const parent = el.parentElement;
-                if (parent) {
-                  const siblings = Array.from(parent.children);
-                  for (const sib of siblings) {
-                    if (sib === el) continue;
-                    const p = extractPercent(sib.innerText);
-                    if (p !== null) {
-                      results[label] = { percent: p, context: sib.innerText.slice(0, 400), source: 'sibling' };
-                      break;
+              for (const label of labels) {
+                const labelLower = label.toLowerCase();
+                if (lowerText.includes(labelLower) && !results[label]) {
+                  const percent = extractPercent(text);
+                  if (percent !== null) {
+                    results[label] = { percent, context: text.slice(0, 400), source: 'same-element' };
+                    continue;
+                  }
+
+                  const parent = el.parentElement;
+                  if (parent) {
+                    const siblings = Array.from(parent.children);
+                    for (const sib of siblings) {
+                      if (sib === el) continue;
+                      const p = extractPercent(sib.innerText);
+                      if (p !== null) {
+                        results[label] = { percent: p, context: sib.innerText.slice(0, 400), source: 'sibling' };
+                        break;
+                      }
                     }
                   }
                 }
               }
             }
-          }
 
-          if (Object.keys(results).length === 0) {
-            const text = document.body.innerText;
-            const apyMatches = [...text.matchAll(/(?:APY|Total Combined).*?(-?[\d,]+(?:\.\d+)?)\s*%?/gi)] ||
-                              [...text.matchAll(/(-?[\d,]+(?:\.\d+)?)%/g)];
-            for (const m of apyMatches) {
-              const window = m[0].toLowerCase();
-              for (const label of labels) {
-                if (!results[label] && window.includes(label.toLowerCase())) {
-                  const num = parseFloat(m[1]?.replace(/,/g, '') || m[0].match(/[\d.]+/)[0]);
-                  if (!isNaN(num)) {
-                    results[label] = { percent: num, context: window, source: 'APY-block' };
+            if (Object.keys(results).length === 0) {
+              const text = document.body.innerText;
+              const apyMatches = [...text.matchAll(/(?:APY|Total Combined).*?(-?[\d,]+(?:\.\d+)?)\s*%?/gi)] ||
+                                [...text.matchAll(/(-?[\d,]+(?:\.\d+)?)%/g)];
+              for (const m of apyMatches) {
+                const window = m[0].toLowerCase();
+                for (const label of labels) {
+                  if (!results[label] && window.includes(label.toLowerCase())) {
+                    const num = parseFloat(m[1]?.replace(/,/g, '') || m[0].match(/[\d.]+/)[0]);
+                    if (!isNaN(num)) {
+                      results[label] = { percent: num, context: window, source: 'APY-block' };
+                    }
                   }
                 }
               }
             }
+
+            return results;
+          }, labels, tokenHint);
+
+          // === Маппинг ===
+          const mapLabel = (label, tokenHint) => {
+            const l = label.toLowerCase();
+            if (l.includes('fixed apy')) {
+              const map = { 'xSOL': 'PT-xSOL', 'hyUSD': 'PT-hyUSD', 'sHYUSD': 'PT-sHYUSD', 'hyloSOL+': 'PT-hyloSOL+', 'hyloSOL': 'PT-hyloSOL' };
+              return map[tokenHint] || 'PT-' + tokenHint.toUpperCase();
+            }
+            if (l.includes('total combined apy') || l.includes('variable apy')) {
+              const map = { 'xSOL': 'xSOL', 'hyUSD': 'hyUSD', 'sHYUSD': 'sHYUSD', 'hyloSOL+': 'hyloSOL+', 'hyloSOL': 'hyloSOL' };
+              return map[tokenHint] || tokenHint.toUpperCase();
+            }
+            if (l.includes('pt') && l.includes('xsol')) return 'PT-xSOL';
+            if (l.includes('pt') && l.includes('hyusd') && !l.includes('shyusd')) return 'PT-hyUSD';
+            if (l.includes('pt') && l.includes('shyusd')) return 'PT-sHYUSD';
+            if (l.includes('pt') && l.includes('hylosol') && l.includes('+')) return 'PT-hyloSOL+';
+            if (l.includes('pt') && l.includes('hylosol') && !l.includes('+')) return 'PT-hyloSOL';
+            if (l.includes('xsol') && !l.includes('pt')) return 'xSOL';
+            if (l.includes('hyusd') && !l.includes('pt') && !l.includes('shyusd')) return 'hyUSD';
+            if (l.includes('shyusd') && !l.includes('pt')) return 'sHYUSD';
+            if (l.includes('hylosol') && l.includes('+') && !l.includes('pt')) return 'hyloSOL+';
+            if (l.includes('hylosol') && !l.includes('+') && !l.includes('pt')) return 'hyloSOL';
+            return null;
+          };
+
+          const normalized = {
+            'PT-xSOL': null, 'xSOL': null,
+            'PT-hyUSD': null, 'hyUSD': null,
+            'PT-sHYUSD': null, 'sHYUSD': null,
+            'PT-hyloSOL+': null, 'hyloSOL+': null,
+            'PT-hyloSOL': null, 'hyloSOL': null
+          };
+
+          for (const [key, val] of Object.entries(found)) {
+            const mapped = mapLabel(key, tokenHint);
+            if (mapped && !normalized[mapped]) {
+              normalized[mapped] = val;
+            }
           }
 
-          return results;
-        }, labels, tokenHint);
+          const nonNull = Object.fromEntries(Object.entries(normalized).filter(([_, v]) => v !== null));
+          console.log(`Parsed ${siteKey} (${tokenHint}):`, nonNull);
 
-        // === Маппинг ===
-        const mapLabel = (label, tokenHint) => {
-          const l = label.toLowerCase();
-          if (l.includes('fixed apy')) {
-            const map = { 'xSOL': 'PT-xSOL', 'hyUSD': 'PT-hyUSD', 'sHYUSD': 'PT-sHYUSD', 'hyloSOL+': 'PT-hyloSOL+', 'hyloSOL': 'PT-hyloSOL' };
-            return map[tokenHint] || 'PT-' + tokenHint.toUpperCase();
-          }
-          if (l.includes('total combined apy') || l.includes('variable apy')) {
-            const map = { 'xSOL': 'xSOL', 'hyUSD': 'hyUSD', 'sHYUSD': 'sHYUSD', 'hyloSOL+': 'hyloSOL+', 'hyloSOL': 'hyloSOL' };
-            return map[tokenHint] || tokenHint.toUpperCase();
-          }
-          if (l.includes('pt') && l.includes('xsol')) return 'PT-xSOL';
-          if (l.includes('pt') && l.includes('hyusd') && !l.includes('shyusd')) return 'PT-hyUSD';
-          if (l.includes('pt') && l.includes('shyusd')) return 'PT-sHYUSD';
-          if (l.includes('pt') && l.includes('hylosol') && l.includes('+')) return 'PT-hyloSOL+';
-          if (l.includes('pt') && l.includes('hylosol') && !l.includes('+')) return 'PT-hyloSOL';
-          if (l.includes('xsol') && !l.includes('pt')) return 'xSOL';
-          if (l.includes('hyusd') && !l.includes('pt') && !l.includes('shyusd')) return 'hyUSD';
-          if (l.includes('shyusd') && !l.includes('pt')) return 'sHYUSD';
-          if (l.includes('hylosol') && l.includes('+') && !l.includes('pt')) return 'hyloSOL+';
-          if (l.includes('hylosol') && !l.includes('+') && !l.includes('pt')) return 'hyloSOL';
-          return null;
-        };
+          await page.close();
+          if (isRateX) await browser.close();
 
-        const normalized = {
-          'PT-xSOL': null, 'xSOL': null,
-          'PT-hyUSD': null, 'hyUSD': null,
-          'PT-sHYUSD': null, 'sHYUSD': null,
-          'PT-hyloSOL+': null, 'hyloSOL+': null,
-          'PT-hyloSOL': null, 'hyloSOL': null
-        };
+          clearTimeout(globalTimeout);
+          return { ok: true, data: normalized, textSnippet: pageText.slice(0, 2000) };
 
-        for (const [key, val] of Object.entries(found)) {
-          const mapped = mapLabel(key, tokenHint);
-          if (mapped && !normalized[mapped]) {
-            normalized[mapped] = val;
-          }
-        }
-
-        const nonNull = Object.fromEntries(Object.entries(normalized).filter(([_, v]) => v !== null));
-        console.log(`Parsed ${siteKey} (${tokenHint}):`, nonNull);
-
-        await page.close();
-        if (isRateX) await browser.close();
-
-        return { ok: true, data: normalized, textSnippet: pageText.slice(0, 2000) };
-
-      } catch (err) {
-        if (NODE_ENV !== 'production') {
-          try {
-            await page?.screenshot({ path: `debug-${siteKey}.png`, fullPage: true });
-            console.log(`Screenshot saved: debug-${siteKey}.png`);
-          } catch (e) {}
-        }
-
-        try { await page?.close(); if (isRateX) await browser?.close(); } catch (e) {}
-
-        throw err;
-      }
-    },
-    {
-      retries: 2,
-      onFailedAttempt: (failure) => {
-        const errorMessage = failure.error?.message || 'Unknown error';
-        console.warn(`Attempt ${failure.attemptNumber} failed for ${siteKey}:`, errorMessage);
-
-        if (failure.attemptNumber >= 2) {
-          const finalError = failure.error || new Error(`Failed after ${failure.attemptNumber} attempts`);
-          throw finalError;
+        } catch (err) {
+          clearTimeout(globalTimeout);
+          throw err;
         }
       },
-    }
-  );
+      {
+        retries: 1,
+        onFailedAttempt: (failure) => {
+          console.warn(`Attempt ${failure.attemptNumber} failed for ${siteKey}:`, failure.error?.message || 'Unknown');
+        },
+      }
+    );
+  } catch (err) {
+    clearTimeout(globalTimeout);
+    console.error(`ABORTED ${siteKey}:`, err.message);
+    return { ok: false, data: null };
+  }
 }
 
-// === API: /api/apy (ПОСЛЕДОВАТЕЛЬНЫЙ + БЕЗОПАСНЫЙ) ===
+// === API: /api/apy с ГЛОБАЛЬНЫМ ТАЙМАУТОМ ===
 app.get('/api/apy', async (req, res) => {
+  const globalTimeout = setTimeout(() => {
+    res.status(504).json({ ok: false, error: 'Gateway timeout' });
+  }, 180000); // 3 минуты максимум
+
   try {
     const now = Date.now();
     const force = req.query.force === '1';
 
     if (!force && cache.data && (now - cache.ts) < CACHE_TTL_MS) {
+      clearTimeout(globalTimeout);
       return res.json({ ok: true, source: 'cache', data: cache.data, cached_at: new Date(cache.ts).toISOString() });
     }
 
     const results = {};
 
-    // === Exponent: ПОСЛЕДОВАТЕЛЬНО ===
+    // === Exponent: ПОСЛЕДОВАТЕЛЬНО с ТАЙМАУТОМ ===
     const expTasks = [
       { key: 'exponent-xsol-1', url: EXPONENT_XSOL_1, hint: 'xSOL' },
       { key: 'exponent-xsol-2', url: EXPONENT_XSOL_2, hint: 'xSOL' },
@@ -327,17 +326,23 @@ app.get('/api/apy', async (req, res) => {
     ];
 
     for (const task of expTasks) {
+      const taskTimeout = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Task timeout')), 45000)
+      );
       try {
-        const data = await fetchApysFromPage(task.url, LABELS_EXPONENT, task.key, task.hint, false);
+        const data = await Promise.race([
+          fetchApysFromPage(task.url, LABELS_EXPONENT, task.key, task.hint, false),
+          taskTimeout
+        ]);
         results[task.key] = data.ok ? data.data : null;
         console.log(`Success: ${task.key}`);
       } catch (err) {
-        console.error(`Failed: ${task.key} — ${err.message}`);
+        console.error(`Failed/Timeout: ${task.key}`);
         results[task.key] = null;
       }
     }
 
-    // === RateX: ПАРАЛЛЕЛЬНО ===
+    // === RateX: ПАРАЛЛЕЛЬНО с ТАЙМАУТОМ ===
     const ratexTasks = [
       { key: 'ratex-xsol', url: RATEX_XSOL, hint: 'xSOL' },
       { key: 'ratex-hyusd', url: RATEX_HYUSD, hint: 'hyUSD' },
@@ -347,7 +352,12 @@ app.get('/api/apy', async (req, res) => {
     ];
 
     const ratexSettled = await Promise.allSettled(
-      ratexTasks.map(t => fetchApysFromPage(t.url, LABELS_RATEX, t.key, t.hint, true))
+      ratexTasks.map(t =>
+        Promise.race([
+          fetchApysFromPage(t.url, LABELS_RATEX, t.key, t.hint, true),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('RateX timeout')), 30000))
+        ]).catch(() => ({ ok: false }))
+      )
     );
 
     ratexTasks.forEach((t, i) => {
@@ -355,7 +365,7 @@ app.get('/api/apy', async (req, res) => {
       results[t.key] = res.status === 'fulfilled' && res.value.ok ? res.value.data : null;
     });
 
-    // === Формируем ответ ===
+    // === Ответ ===
     const get = (obj, key) => obj?.[key]?.percent ?? null;
 
     const data = {
@@ -385,10 +395,12 @@ app.get('/api/apy', async (req, res) => {
     };
 
     cache = { ts: now, data };
+    clearTimeout(globalTimeout);
     res.json({ ok: true, source: 'live', data });
 
   } catch (e) {
-    console.error('API /api/apy fatal error:', e);
+    clearTimeout(globalTimeout);
+    console.error('API /api/apy error:', e);
     res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
