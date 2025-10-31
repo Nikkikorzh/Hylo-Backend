@@ -49,14 +49,31 @@ const CACHE_TTL_MS = 60 * 1000;
 
 // === Shared Browser (только для Exponent) ===
 // === Shared Browser ===
+// === Shared Browser ===
 let sharedBrowser = null;
 async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
 
   console.log('Puppeteer browser launching...');
 
-  // ДИНАМИЧЕСКИЙ ПУТЬ К ПОСЛЕДНЕЙ УСТАНОВКЕ CHROME
-  const chromePath = '/opt/render/.cache/puppeteer/chrome/latest/chrome-linux64/chrome';
+  // ДИНАМИЧЕСКИЙ ПОИСК CHROME
+  const fs = await import('fs');
+  const path = await import('path');
+  const puppeteerDir = '/opt/render/.cache/puppeteer/chrome';
+  let chromePath = null;
+
+  if (fs.existsSync(puppeteerDir)) {
+    const versions = fs.readdirSync(puppeteerDir).filter(dir => dir.startsWith('linux-'));
+    if (versions.length > 0) {
+      const latestVersion = versions[versions.length - 1];
+      chromePath = path.join(puppeteerDir, latestVersion, 'chrome-linux64/chrome');
+      console.log(`Found Chrome at: ${chromePath}`);
+    }
+  }
+
+  if (!chromePath) {
+    throw new Error('Chrome not found in cache');
+  }
 
   sharedBrowser = await puppeteer.launch({
     headless: true,
@@ -89,9 +106,27 @@ async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = fals
     let page;
 
     if (isRateX) {
+  // Тот же динамический поиск
+  const fs = await import('fs');
+  const path = await import('path');
+  const puppeteerDir = '/opt/render/.cache/puppeteer/chrome';
+  let chromePath = null;
+
+  if (fs.existsSync(puppeteerDir)) {
+    const versions = fs.readdirSync(puppeteerDir).filter(dir => dir.startsWith('linux-'));
+    if (versions.length > 0) {
+      const latestVersion = versions[versions.length - 1];
+      chromePath = path.join(puppeteerDir, latestVersion, 'chrome-linux64/chrome');
+    }
+  }
+
+  if (!chromePath) {
+    throw new Error('Chrome not found for Rate-X');
+  }
+
   browser = await puppeteer.launch({
     headless: true,
-    executablePath: '/opt/render/.cache/puppeteer/chrome/latest/chrome-linux64/chrome',
+    executablePath: chromePath,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
