@@ -10,7 +10,8 @@
     "cors": "^2.8.5",
     "p-retry": "^6.2.0",
     "puppeteer-core": "^23.0.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "@sparticuz/chromium": "^122.0.0"
   },
   "render": {
     "buildDependencies": [
