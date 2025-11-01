@@ -4,7 +4,6 @@ import dotenv from 'dotenv';
 import pRetry from 'p-retry';
 import puppeteer from 'puppeteer-core';
 import chromium from '@sparticuz/chromium';
-import fetch from 'node-fetch';
 
 dotenv.config();
 
@@ -25,14 +24,6 @@ const RATEX_HYUSD = 'https://app.rate-x.io/points?symbol=hyUSD-2601';
 const RATEX_HYLOSOL_PLUS = 'https://app.rate-x.io/points?symbol=hyloSOL%252B-2511';
 const RATEX_HYLOSOL = 'https://app.rate-x.io/points?symbol=hyloSOL-2511';
 const RATEX_SHYUSD = 'https://app.rate-x.io/points?symbol=sHYUSD-2601';
-
-// === Labels ===
-const LABELS_EXPONENT = [
-  'xSOL', 'PT-xSOL', 'hyUSD', 'PT-hyUSD', 'pt-hyusd',
-  'hyloSOL+', 'PT-hyloSOL+', 'hylosolplus',
-  'hyloSOL', 'PT-hyloSOL', 'hylosol',
-  'sHYUSD', 'shyusd'
-];
 
 // === Caching ===
 let cache = { ts: 0, data: null };
@@ -78,112 +69,79 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// === fetchApysFromPage (Exponent) ===
-async function fetchExponentApys(url, siteKey, tokenHint) {
-  const timeout = setTimeout(() => { throw new Error('Timeout'); }, 45000);
+// === fetchApys (универсальная) ===
+async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
+  const timeout = setTimeout(() => { throw new Error('Timeout'); }, isRateX ? 60000 : 45000);
   try {
     return await pRetry(
       async () => {
-        const browser = await getSharedBrowser();
+        const browser = isRateX 
+          ? await puppeteer.launch({ args: chromium.args, executablePath: await chromium.executablePath(), headless: chromium.headless })
+          : await getSharedBrowser();
         const page = await browser.newPage();
 
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        // Анти-детект
         await page.evaluateOnNewDocument(() => {
           Object.defineProperty(navigator, 'webdriver', { get: () => false });
+          Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
           window.chrome = { runtime: {} };
         });
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+
+        if (isRateX) {
+          await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,*/*'
+          });
+        }
 
         await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
 
-        // Закрываем модалку
-        await page.evaluate(() => {
-          document.querySelectorAll('button[aria-label*="close" i], button svg, [role="dialog"] button').forEach(b => b.click());
-        });
-        await sleep(1500);
-
-        // Ждём APY
-        await page.waitForFunction(() => document.body.innerText.includes('Total APY'), { timeout: 10000 }).catch(() => {});
-
-        const found = await page.evaluate((labels, hint) => {
-          const results = {};
-          const extract = text => (text.match(/(-?[\d,]+(?:\.\d+)?)%/) || [])[1]?.replace(/,/g, '');
-          const elements = Array.from(document.querySelectorAll('body *')).filter(el => el.innerText?.length < 1000);
-
-          for (const el of elements) {
-            const text = el.innerText;
-            const lower = text.toLowerCase();
-            for (const label of labels) {
-              if (lower.includes(label.toLowerCase()) && !results[label]) {
-                const p = extract(text) || extract(el.parentElement?.innerText);
-                if (p) results[label] = { percent: parseFloat(p) };
-              }
-            }
-          }
-          return results;
-        }, LABELS_EXPONENT, tokenHint);
-
-        const map = {
-          'xSOL': 'xSOL', 'PT-xSOL': 'PT-xSOL',
-          'hyUSD': 'hyUSD', 'PT-hyUSD': 'PT-hyUSD',
-          'sHYUSD': 'sHYUSD', 'shyusd': 'sHYUSD',
-          'hyloSOL+': 'hyloSOL+', 'PT-hyloSOL+': 'PT-hyloSOL+',
-          'hyloSOL': 'hyloSOL', 'PT-hyloSOL': 'PT-hyloSOL'
-        };
-
-        const normalized = { 'PT-xSOL': null, 'xSOL': null, 'PT-hyUSD': null, 'hyUSD': null, 'PT-sHYUSD': null, 'sHYUSD': null, 'PT-hyloSOL+': null, 'hyloSOL+': null, 'PT-hyloSOL': null, 'hyloSOL': null };
-        for (const [k, v] of Object.entries(found)) {
-          const m = map[k] || map[k.toLowerCase()];
-          if (m && !normalized[m]) normalized[m] = v;
+        if (!isRateX) {
+          // Закрываем модалку
+          await page.evaluate(() => {
+            document.querySelectorAll('button[aria-label*="close" i], button svg, [role="dialog"] button').forEach(b => b.click());
+          });
+          await sleep(1500);
+          await page.waitForFunction(() => document.body.innerText.includes('Total APY'), { timeout: 10000 }).catch(() => {});
+        } else {
+          await page.waitForFunction(() => document.body.innerText.includes('Fixed APY'), { timeout: 20000 }).catch(() => {});
+          await sleep(2000);
         }
 
+        const data = await page.evaluate((isRateX, hint) => {
+          const text = document.body.innerText;
+          const extract = regex => (text.match(regex) || [])[1]?.replace(/,/g, '');
+
+          if (isRateX) {
+            const pt = extract(/Fixed APY[^0-9]*([\d.]+)%/i);
+            const base = extract(/Total Combined APY[^0-9]*([\d.]+)%/i) || extract(/Variable APY[^0-9]*([\d.]+)%/i);
+            return { pt: pt ? parseFloat(pt) : null, base: base ? parseFloat(base) : null };
+          }
+
+          const apy = extract(/Total APY[^0-9]*([\d.]+)%/i);
+          return { apy: apy ? parseFloat(apy) : null };
+        }, isRateX, tokenHint);
+
         await page.close();
+        if (isRateX) await browser.close();
+
         clearTimeout(timeout);
-        console.log(`Exponent ${siteKey}:`, normalized);
-        return { ok: true, data: normalized };
+        console.log(`${isRateX ? 'RateX' : 'Exponent'} ${siteKey}:`, data);
+        return { ok: true, data };
       },
       { retries: 1 }
     );
   } catch (err) {
     clearTimeout(timeout);
-    console.error(`Exponent ${siteKey} failed:`, err.message);
-    return { ok: false };
-  }
-}
-
-// === fetchRateXApy (RateX via fetch) ===
-async function fetchRateXApy(url, hint) {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,*/*'
-      }
-    });
-    const html = await res.text();
-
-    const fixed = html.match(/Fixed APY[^>]*>[\s]*([\d.]+)%/i);
-    const total = html.match(/Total Combined APY[^>]*>[\s]*([\d.]+)%/i) || html.match(/Variable APY[^>]*>[\s]*([\d.]+)%/i);
-
-    const pt = fixed ? parseFloat(fixed[1]) : null;
-    const base = total ? parseFloat(total[1]) : null;
-
-    console.log(`RateX ${hint}: PT=${pt}%, Base=${base}%`);
-    return {
-      ok: true,
-      data: {
-        [`PT-${hint}`]: { percent: pt },
-        [hint]: { percent: base }
-      }
-    };
-  } catch (err) {
-    console.error(`RateX ${hint} failed:`, err.message);
+    console.error(`${isRateX ? 'RateX' : 'Exponent'} ${siteKey} failed:`, err.message);
     return { ok: false };
   }
 }
 
 // === /api/apy ===
 app.get('/api/apy', async (req, res) => {
-  const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 180000);
+  const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 300000);
   try {
     const now = Date.now();
     const force = req.query.force === '1';
@@ -195,7 +153,7 @@ app.get('/api/apy', async (req, res) => {
 
     const results = {};
 
-    // === Exponent (последовательно) ===
+    // === Exponent ===
     const expTasks = [
       { key: 'exponent-xsol-1', url: EXPONENT_XSOL_1, hint: 'xSOL' },
       { key: 'exponent-xsol-2', url: EXPONENT_XSOL_2, hint: 'xSOL' },
@@ -206,54 +164,54 @@ app.get('/api/apy', async (req, res) => {
     ];
 
     for (const task of expTasks) {
-      const data = await Promise.race([
-        fetchExponentApys(task.url, task.key, task.hint),
-        new Promise((_, r) => setTimeout(() => r({ ok: false }), 45000))
-      ]);
-      results[task.key] = data.ok ? data.data : null;
+      const data = await fetchApys(task.url, task.key, task.hint, false);
+      if (data.ok) {
+        results[task.key] = { apy: data.data.apy };
+      }
     }
 
-    // === RateX (параллельно, fetch) ===
+    // === RateX ===
     const ratexResults = await Promise.allSettled([
-      fetchRateXApy(RATEX_XSOL, 'xSOL'),
-      fetchRateXApy(RATEX_HYUSD, 'hyUSD'),
-      fetchRateXApy(RATEX_HYLOSOL_PLUS, 'hyloSOL+'),
-      fetchRateXApy(RATEX_HYLOSOL, 'hyloSOL'),
-      fetchRateXApy(RATEX_SHYUSD, 'sHYUSD')
+      fetchApys(RATEX_XSOL, 'ratex-xsol', 'xSOL', true),
+      fetchApys(RATEX_HYUSD, 'ratex-hyusd', 'hyUSD', true),
+      fetchApys(RATEX_HYLOSOL_PLUS, 'ratex-hylosolplus', 'hyloSOL+', true),
+      fetchApys(RATEX_HYLOSOL, 'ratex-hylosol', 'hyloSOL', true),
+      fetchApys(RATEX_SHYUSD, 'ratex-shyusd', 'sHYUSD', true)
     ]);
 
-    const ratexKeys = ['ratex-xsol', 'ratex-hyusd', 'ratex-hylosolplus', 'ratex-hylosol', 'ratex-shyusd'];
-    ratexKeys.forEach((key, i) => {
-      const res = ratexResults[i];
-      results[key] = res.status === 'fulfilled' && res.value.ok ? res.value.data : null;
+    ratexResults.forEach((res, i) => {
+      if (res.status === 'fulfilled' && res.value.ok) {
+        const key = ['ratex-xsol', 'ratex-hyusd', 'ratex-hylosolplus', 'ratex-hylosol', 'ratex-shyusd'][i];
+        results[key] = { pt: res.value.data.pt, base: res.value.data.base };
+      }
     });
 
     // === Ответ ===
-    const get = (obj, key) => obj?.[key]?.percent ?? null;
+    const get = (obj, key) => obj?.[key] ?? null;
     const data = {
-      exponent_xSOL_1: get(results['exponent-xsol-1'], 'xSOL'),
-      exponent_PT_xSOL_1: get(results['exponent-xsol-1'], 'PT-xSOL'),
-      exponent_xSOL_2: get(results['exponent-xsol-2'], 'xSOL'),
-      exponent_PT_xSOL_2: get(results['exponent-xsol-2'], 'PT-xSOL'),
-      exponent_hyUSD: get(results['exponent-hyusd'], 'hyUSD'),
-      exponent_PT_hyUSD: get(results['exponent-hyusd'], 'PT-hyUSD'),
-      exponent_hylosolplus: get(results['exponent-hylosolplus'], 'PT-hyloSOL+'),
-      exponent_hylosol: get(results['exponent-hylosol'], 'PT-hyloSOL'),
-      exponent_sHYUSD: get(results['exponent-shyusd'], 'sHYUSD'),
+      exponent_xSOL_1: get(results['exponent-xsol-1'], 'apy'),
+      exponent_PT_xSOL_1: get(results['exponent-xsol-1'], 'apy'),
+      exponent_xSOL_2: get(results['exponent-xsol-2'], 'apy'),
+      exponent_PT_xSOL_2: get(results['exponent-xsol-2'], 'apy'),
+      exponent_hyUSD: get(results['exponent-hyusd'], 'apy'),
+      exponent_PT_hyUSD: get(results['exponent-hyusd'], 'apy'),
+      exponent_hylosolplus: get(results['exponent-hylosolplus'], 'apy'),
+      exponent_hylosol: get(results['exponent-hylosol'], 'apy'),
+      exponent_sHYUSD: get(results['exponent-shyusd'], 'apy'),
 
-      ratex_xSOL: get(results['ratex-xsol'], 'xSOL'),
-      ratex_PT_xSOL: get(results['ratex-xsol'], 'PT-xSOL'),
-      ratex_hyUSD: get(results['ratex-hyusd'], 'hyUSD'),
-      ratex_PT_hyUSD: get(results['ratex-hyusd'], 'PT-hyUSD'),
-      ratex_hylosolplus: get(results['ratex-hylosolplus'], 'hyloSOL+'),
-      ratex_PT_hylosolplus: get(results['ratex-hylosolplus'], 'PT-hyloSOL+'),
-      ratex_hylosol: get(results['ratex-hylosol'], 'hyloSOL'),
-      ratex_PT_hylosol: get(results['ratex-hylosol'], 'PT-hyloSOL'),
-      ratex_sHYUSD: get(results['ratex-shyusd'], 'sHYUSD'),
-      ratex_PT_sHYUSD: get(results['ratex-shyusd'], 'PT-sHYUSD'),
+      ratex_xSOL: get(results['ratex-xsol'], 'base'),
+      ratex_PT_xSOL: get(results['ratex-xsol'], 'pt'),
+      ratex_hyUSD: get(results['ratex-hyusd'], 'base'),
+      ratex_PT_hyUSD: get(results['ratex-hyusd'], 'pt'),
+      ratex_hylosolplus: get(results['ratex-hylosolplus'], 'base'),
+      ratex_PT_hylosolplus: get(results['ratex-hylosolplus'], 'pt'),
+      ratex_hylosol: get(results['ratex-hylosol'], 'base'),
+      ratex_PT_hylosol: get(results['ratex-hylosol'], 'pt'),
+      ratex_sHYUSD: get(results['ratex-shyusd'], 'base'),
+      ratex_PT_sHYUSD: get(results['ratex-shyusd'], 'pt'),
 
       fetched_at: new Date().toISOString(),
-      partial: Object.values(results).some(v => v === null)
+      partial: false
     };
 
     cache = { ts: now, data };
