@@ -31,7 +31,7 @@ const RATEX_URLS = {
 
 // === Caching ===
 let cache = { ts: 0, data: null };
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут
+const CACHE_TTL_MS = 60 * 1000; // 1 минута
 
 // === Shared Browser ===
 let sharedBrowser = null;
@@ -73,12 +73,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// === Универсальная функция парсинга ===
+// === Универсальная функция парсинга (БЕЗОПАСНАЯ) ===
 async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
-  const timeout = setTimeout(() => { throw new Error('Timeout'); }, isRateX ? 90000 : 60000);
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; }, isRateX ? 90000 : 60000);
+
   try {
     return await pRetry(
       async () => {
+        if (timedOut) throw new Error('Timeout');
+
         const browser = await getSharedBrowser();
         const page = await browser.newPage();
 
@@ -132,6 +136,10 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
     );
   } catch (err) {
     clearTimeout(timeout);
+    if (timedOut || err.message === 'Timeout') {
+      console.warn(`${isRateX ? 'RateX' : 'Exponent'} ${siteKey} timed out`);
+      return { ok: false, error: 'timeout' };
+    }
     console.error(`${isRateX ? 'RateX' : 'Exponent'} ${siteKey} failed:`, err.message);
     return { ok: false };
   }
@@ -155,7 +163,6 @@ app.post('/api/calc', (req, res) => {
     if (rateType.toUpperCase() === 'APY') {
       final = P * Math.pow(1 + r, d / 365);
     } else {
-      // APR → APY
       const apy = Math.pow(1 + r / n, n) - 1;
       final = P * Math.pow(1 + apy, d / 365);
     }
@@ -178,11 +185,12 @@ app.post('/api/calc', (req, res) => {
 
 // === /api/apy ===
 app.get('/api/apy', async (req, res) => {
-  const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 600000); // 10 минут
+  const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Global timeout' }), 600000);
   try {
     const now = Date.now();
     const force = req.query.force === '1';
 
+    // === Кэш в памяти ===
     if (!force && cache.data && now - cache.ts < CACHE_TTL_MS) {
       clearTimeout(globalTimeout);
       return res.json({ ok: true, source: 'cache', data: cache.data });
@@ -190,20 +198,24 @@ app.get('/api/apy', async (req, res) => {
 
     const results = {};
 
-    // === 1. RateX ПОСЛЕДОВАТЕЛЬНО ===
+    // === 1. RateX ===
     for (const [key, url] of Object.entries(RATEX_URLS)) {
       const hint = key.split('-')[1].toUpperCase().replace('SHYUSD', 'sHYUSD');
       const data = await fetchApys(url, key, hint, true);
       if (data.ok) {
         results[key] = { pt: data.data.pt, base: data.data.base };
+      } else {
+        results[key] = { pt: null, base: null };
       }
     }
 
-    // === 2. Exponent ПОСЛЕДОВАТЕЛЬНО ===
+    // === 2. Exponent ===
     for (const [key, url] of Object.entries(EXPONENT_URLS)) {
       const data = await fetchApys(url, key, null, false);
       if (data.ok) {
         results[key] = { apy: data.data.apy };
+      } else {
+        results[key] = { apy: null };
       }
     }
 
@@ -232,11 +244,13 @@ app.get('/api/apy', async (req, res) => {
       ratex_PT_sHYUSD: get(results['ratex-shyusd'], 'pt'),
 
       fetched_at: new Date().toISOString(),
-      partial: false
+      partial: true
     };
 
     cache = { ts: now, data };
     clearTimeout(globalTimeout);
+
+    // === Edge Cache (CDN) ===
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30');
     res.json({ ok: true, source: 'live', data });
   } catch (e) {
