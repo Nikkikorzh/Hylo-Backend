@@ -137,6 +137,45 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
   }
 }
 
+// === /api/calc — Калькулятор прибыли ===
+app.post('/api/calc', (req, res) => {
+  try {
+    const { principal, rate, rateType = 'APY', days, compoundingPerYear = 365 } = req.body;
+
+    const P = Number(principal);
+    const r = Number(rate) / 100;
+    const d = Number(days);
+    const n = Number(compoundingPerYear);
+
+    if (!P || !r || !d) {
+      return res.status(400).json({ ok: false, error: 'principal, rate, days required' });
+    }
+
+    let final = 0;
+    if (rateType.toUpperCase() === 'APY') {
+      final = P * Math.pow(1 + r, d / 365);
+    } else {
+      // APR → APY
+      const apy = Math.pow(1 + r / n, n) - 1;
+      final = P * Math.pow(1 + apy, d / 365);
+    }
+
+    const profit = final - P;
+
+    res.json({
+      ok: true,
+      principal: P,
+      final: final.toFixed(2),
+      profit: profit.toFixed(2),
+      days: d,
+      rateType,
+    });
+  } catch (e) {
+    console.error('Calc error:', e);
+    res.status(500).json({ ok: false, error: 'Server error' });
+  }
+});
+
 // === /api/apy ===
 app.get('/api/apy', async (req, res) => {
   const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 600000); // 10 минут
