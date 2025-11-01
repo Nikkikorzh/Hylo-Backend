@@ -12,18 +12,22 @@ app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.use(express.json());
 
 // === URLs ===
-const EXPONENT_XSOL_1 = 'https://www.exponent.finance/liquidity/xsol-26Nov25-1';
-const EXPONENT_XSOL_2 = 'https://www.exponent.finance/liquidity/xsol-26Nov25';
-const EXPONENT_HYUSD = 'https://www.exponent.finance/liquidity/hyusd-15Dec25';
-const EXPONENT_HYLOSOL_PLUS = 'https://www.exponent.finance/liquidity/hylosolplus-15Dec25';
-const EXPONENT_HYLOSOL = 'https://www.exponent.finance/liquidity/hylosol-10Dec25';
-const EXPONENT_SHYUSD = 'https://www.exponent.finance/liquidity/shyusd-18Nov25';
+const EXPONENT_URLS = {
+  'exponent-xsol-1': 'https://www.exponent.finance/liquidity/xsol-26Nov25-1',
+  'exponent-xsol-2': 'https://www.exponent.finance/liquidity/xsol-26Nov25',
+  'exponent-hyusd': 'https://www.exponent.finance/liquidity/hyusd-15Dec25',
+  'exponent-hylosolplus': 'https://www.exponent.finance/liquidity/hylosolplus-15Dec25',
+  'exponent-hylosol': 'https://www.exponent.finance/liquidity/hylosol-10Dec25',
+  'exponent-shyusd': 'https://www.exponent.finance/liquidity/shyusd-18Nov25',
+};
 
-const RATEX_XSOL = 'https://app.rate-x.io/points?symbol=xSOL-2511';
-const RATEX_HYUSD = 'https://app.rate-x.io/points?symbol=hyUSD-2601';
-const RATEX_HYLOSOL_PLUS = 'https://app.rate-x.io/points?symbol=hyloSOL%252B-2511';
-const RATEX_HYLOSOL = 'https://app.rate-x.io/points?symbol=hyloSOL-2511';
-const RATEX_SHYUSD = 'https://app.rate-x.io/points?symbol=sHYUSD-2601';
+const RATEX_URLS = {
+  'ratex-xsol': 'https://app.rate-x.io/points?symbol=xSOL-2511',
+  'ratex-hyusd': 'https://app.rate-x.io/points?symbol=hyUSD-2601',
+  'ratex-hylosolplus': 'https://app.rate-x.io/points?symbol=hyloSOL%252B-2511',
+  'ratex-hylosol': 'https://app.rate-x.io/points?symbol=hyloSOL-2511',
+  'ratex-shyusd': 'https://app.rate-x.io/points?symbol=sHYUSD-2601',
+};
 
 // === Caching ===
 let cache = { ts: 0, data: null };
@@ -69,18 +73,15 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// === fetchApys (универсальная) ===
+// === Универсальная функция парсинга ===
 async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
-  const timeout = setTimeout(() => { throw new Error('Timeout'); }, isRateX ? 60000 : 45000);
+  const timeout = setTimeout(() => { throw new Error('Timeout'); }, isRateX ? 90000 : 60000);
   try {
     return await pRetry(
       async () => {
-        const browser = isRateX 
-          ? await puppeteer.launch({ args: chromium.args, executablePath: await chromium.executablePath(), headless: chromium.headless })
-          : await getSharedBrowser();
+        const browser = await getSharedBrowser();
         const page = await browser.newPage();
 
-        // Анти-детект
         await page.evaluateOnNewDocument(() => {
           Object.defineProperty(navigator, 'webdriver', { get: () => false });
           Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
@@ -95,18 +96,17 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
           });
         }
 
-        await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+        await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
 
         if (!isRateX) {
-          // Закрываем модалку
           await page.evaluate(() => {
             document.querySelectorAll('button[aria-label*="close" i], button svg, [role="dialog"] button').forEach(b => b.click());
           });
           await sleep(1500);
-          await page.waitForFunction(() => document.body.innerText.includes('Total APY'), { timeout: 10000 }).catch(() => {});
+          await page.waitForFunction(() => document.body.innerText.includes('Total APY'), { timeout: 15000 }).catch(() => {});
         } else {
-          await page.waitForFunction(() => document.body.innerText.includes('Fixed APY'), { timeout: 20000 }).catch(() => {});
-          await sleep(2000);
+          await page.waitForFunction(() => document.body.innerText.includes('Fixed APY'), { timeout: 30000 }).catch(() => {});
+          await sleep(3000);
         }
 
         const data = await page.evaluate((isRateX, hint) => {
@@ -124,8 +124,6 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
         }, isRateX, tokenHint);
 
         await page.close();
-        if (isRateX) await browser.close();
-
         clearTimeout(timeout);
         console.log(`${isRateX ? 'RateX' : 'Exponent'} ${siteKey}:`, data);
         return { ok: true, data };
@@ -140,9 +138,8 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
 }
 
 // === /api/apy ===
-// === /api/apy (RateX ПЕРВЫМ!) ===
 app.get('/api/apy', async (req, res) => {
-  const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 300000);
+  const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 600000); // 10 минут
   try {
     const now = Date.now();
     const force = req.query.force === '1';
@@ -154,25 +151,16 @@ app.get('/api/apy', async (req, res) => {
 
     const results = {};
 
-    // === 1. RATEX ПЕРВЫМ (параллельно) ===
-    console.log('Starting RateX (first)...');
-    const ratexResults = await Promise.allSettled([
-      fetchApys(RATEX_XSOL, 'ratex-xsol', 'xSOL', true),
-      fetchApys(RATEX_HYUSD, 'ratex-hyusd', 'hyUSD', true),
-      fetchApys(RATEX_HYLOSOL_PLUS, 'ratex-hylosolplus', 'hyloSOL+', true),
-      fetchApys(RATEX_HYLOSOL, 'ratex-hylosol', 'hyloSOL', true),
-      fetchApys(RATEX_SHYUSD, 'ratex-shyusd', 'sHYUSD', true)
-    ]);
-
-    ratexResults.forEach((res, i) => {
-      if (res.status === 'fulfilled' && res.value.ok) {
-        const key = ['ratex-xsol', 'ratex-hyusd', 'ratex-hylosolplus', 'ratex-hylosol', 'ratex-shyusd'][i];
-        results[key] = { pt: res.value.data.pt, base: res.value.data.base };
+    // === 1. RateX ПОСЛЕДОВАТЕЛЬНО ===
+    for (const [key, url] of Object.entries(RATEX_URLS)) {
+      const hint = key.split('-')[1].toUpperCase().replace('SHYUSD', 'sHYUSD');
+      const data = await fetchApys(url, key, hint, true);
+      if (data.ok) {
+        results[key] = { pt: data.data.pt, base: data.data.base };
       }
-    });
+    }
 
-    // === 2. Exponent ПОСЛЕ (последовательно) ===
-    console.log('Starting Exponent (after RateX)...');
+    // === 2. Exponent ПОСЛЕДОВАТЕЛЬНО ===
     for (const [key, url] of Object.entries(EXPONENT_URLS)) {
       const data = await fetchApys(url, key, null, false);
       if (data.ok) {
