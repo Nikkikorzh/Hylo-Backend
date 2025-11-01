@@ -22,7 +22,7 @@ redisClient.on('error', (err) => console.error('Redis error:', err));
 (async () => {
   try {
     await redisClient.connect();
-    console.log('Redis connected');
+    console.log('Redis connected successfully');
   } catch (err) {
     console.error('Redis connection failed:', err);
   }
@@ -201,19 +201,27 @@ app.get('/api/apy', async (req, res) => {
   const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Global timeout' }), 600000);
   try {
     const force = req.query.force === '1';
+    console.log('API /apy called, force:', force);
 
     // === Кэш из Redis ===
     if (!force) {
+      console.log('Checking Redis cache...');
       const cached = await redisClient.get('apy_cache');
       if (cached) {
+        console.log('Cache HIT! Returning from Redis');
         clearTimeout(globalTimeout);
         return res.json({ ok: true, source: 'redis', data: JSON.parse(cached) });
+      } else {
+        console.log('Cache MISS! Fetching live data...');
       }
+    } else {
+      console.log('Force refresh requested — skipping cache');
     }
 
     const results = {};
 
     // === 1. RateX ===
+    console.log('Starting RateX parsing...');
     for (const [key, url] of Object.entries(RATEX_URLS)) {
       const hint = key.split('-')[1].toUpperCase().replace('SHYUSD', 'sHYUSD');
       const data = await fetchApys(url, key, hint, true);
@@ -221,6 +229,7 @@ app.get('/api/apy', async (req, res) => {
     }
 
     // === 2. Exponent ===
+    console.log('Starting Exponent parsing...');
     for (const [key, url] of Object.entries(EXPONENT_URLS)) {
       const data = await fetchApys(url, key, null, false);
       results[key] = data.ok ? { apy: data.data.apy } : { apy: null };
@@ -254,8 +263,9 @@ app.get('/api/apy', async (req, res) => {
       partial: true
     };
 
-    // === Сохраняем в Redis на 60 сек ===
+    // === Сохраняем в Redis ===
     await redisClient.setEx('apy_cache', 60, JSON.stringify(data));
+    console.log('Data saved to Redis cache for 60 seconds');
 
     clearTimeout(globalTimeout);
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30');
