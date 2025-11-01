@@ -237,6 +237,7 @@ app.get('/api/apy', async (req, res) => {
 
     cache = { ts: now, data };
     clearTimeout(globalTimeout);
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30');
     res.json({ ok: true, source: 'live', data });
   } catch (e) {
     clearTimeout(globalTimeout);
