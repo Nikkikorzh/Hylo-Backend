@@ -4,12 +4,29 @@ import dotenv from 'dotenv';
 import pRetry from 'p-retry';
 import puppeteer from 'puppeteer-core';
 import chromium from '@sparticuz/chromium';
+import { createClient } from 'redis';
 
 dotenv.config();
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.use(express.json());
+
+// === Redis Client ===
+const redisClient = createClient({
+  url: process.env.REDIS_URL
+});
+
+redisClient.on('error', (err) => console.error('Redis error:', err));
+
+(async () => {
+  try {
+    await redisClient.connect();
+    console.log('Redis connected');
+  } catch (err) {
+    console.error('Redis connection failed:', err);
+  }
+})();
 
 // === URLs ===
 const EXPONENT_URLS = {
@@ -28,10 +45,6 @@ const RATEX_URLS = {
   'ratex-hylosol': 'https://app.rate-x.io/points?symbol=hyloSOL-2511',
   'ratex-shyusd': 'https://app.rate-x.io/points?symbol=sHYUSD-2601',
 };
-
-// === Caching ===
-let cache = { ts: 0, data: null };
-const CACHE_TTL_MS = 60 * 1000; // 1 минута
 
 // === Shared Browser ===
 let sharedBrowser = null;
@@ -187,13 +200,15 @@ app.post('/api/calc', (req, res) => {
 app.get('/api/apy', async (req, res) => {
   const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Global timeout' }), 600000);
   try {
-    const now = Date.now();
     const force = req.query.force === '1';
 
-    // === Кэш в памяти ===
-    if (!force && cache.data && now - cache.ts < CACHE_TTL_MS) {
-      clearTimeout(globalTimeout);
-      return res.json({ ok: true, source: 'cache', data: cache.data });
+    // === Кэш из Redis ===
+    if (!force) {
+      const cached = await redisClient.get('apy_cache');
+      if (cached) {
+        clearTimeout(globalTimeout);
+        return res.json({ ok: true, source: 'redis', data: JSON.parse(cached) });
+      }
     }
 
     const results = {};
@@ -202,21 +217,13 @@ app.get('/api/apy', async (req, res) => {
     for (const [key, url] of Object.entries(RATEX_URLS)) {
       const hint = key.split('-')[1].toUpperCase().replace('SHYUSD', 'sHYUSD');
       const data = await fetchApys(url, key, hint, true);
-      if (data.ok) {
-        results[key] = { pt: data.data.pt, base: data.data.base };
-      } else {
-        results[key] = { pt: null, base: null };
-      }
+      results[key] = data.ok ? { pt: data.data.pt, base: data.data.base } : { pt: null, base: null };
     }
 
     // === 2. Exponent ===
     for (const [key, url] of Object.entries(EXPONENT_URLS)) {
       const data = await fetchApys(url, key, null, false);
-      if (data.ok) {
-        results[key] = { apy: data.data.apy };
-      } else {
-        results[key] = { apy: null };
-      }
+      results[key] = data.ok ? { apy: data.data.apy } : { apy: null };
     }
 
     // === Ответ ===
@@ -247,10 +254,10 @@ app.get('/api/apy', async (req, res) => {
       partial: true
     };
 
-    cache = { ts: now, data };
-    clearTimeout(globalTimeout);
+    // === Сохраняем в Redis на 60 сек ===
+    await redisClient.setEx('apy_cache', 60, JSON.stringify(data));
 
-    // === Edge Cache (CDN) ===
+    clearTimeout(globalTimeout);
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30');
     res.json({ ok: true, source: 'live', data });
   } catch (e) {
