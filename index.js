@@ -4,14 +4,13 @@ import dotenv from 'dotenv';
 import pRetry from 'p-retry';
 import puppeteer from 'puppeteer-core';
 import chromium from '@sparticuz/chromium';
+import fetch from 'node-fetch';
 
 dotenv.config();
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.use(express.json());
-
-const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // === URLs ===
 const EXPONENT_XSOL_1 = 'https://www.exponent.finance/liquidity/xsol-26Nov25-1';
@@ -32,21 +31,12 @@ const LABELS_EXPONENT = [
   'xSOL', 'PT-xSOL', 'hyUSD', 'PT-hyUSD', 'pt-hyusd',
   'hyloSOL+', 'PT-hyloSOL+', 'hylosolplus',
   'hyloSOL', 'PT-hyloSOL', 'hylosol',
-  'sHYUSD','shyusd'
-];
-
-const LABELS_RATEX = [
-  'xSOL-2511', 'PT-xSOL-2511', 'xSOL',
-  'hyUSD-2601', 'PT-hyUSD-2601', 'hyUSD',
-  'sHYUSD-2601', 'PT-sHYUSD-2601', 'sHYUSD',
-  'hyloSOL+-2511', 'PT-hyloSOL+-2511', 'hyloSOL+',
-  'hyloSOL-2511', 'PT-hyloSOL-2511', 'hyloSOL',
-  'Total Combined APY', 'Fixed APY', 'Variable APY', 'Base APY', 'AMM APY'
+  'sHYUSD', 'shyusd'
 ];
 
 // === Caching ===
 let cache = { ts: 0, data: null };
-const CACHE_TTL_MS = 60 * 1000;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут
 
 // === Shared Browser ===
 let sharedBrowser = null;
@@ -67,6 +57,8 @@ async function getSharedBrowser() {
         '--disable-web-security',
         '--disable-features=IsolateOrigins,site-per-process',
         '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox'
       ],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
@@ -82,240 +74,128 @@ async function getSharedBrowser() {
   return sharedBrowser;
 }
 
-// === Sleep ===
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// === Поиск APY с ТАЙМАУТОМ и ОГРАНИЧЕННЫМ RETRY ===
-async function fetchApysFromPage(url, labels, siteKey, tokenHint, isRateX = false) {
-  const controller = new AbortController();
-  const globalTimeout = setTimeout(() => controller.abort(), 45000); // 45 сек на всё
-
+// === fetchApysFromPage (Exponent) ===
+async function fetchExponentApys(url, siteKey, tokenHint) {
+  const timeout = setTimeout(() => { throw new Error('Timeout'); }, 45000);
   try {
     return await pRetry(
-      async (attempt) => {
-        console.log(`Fetch attempt ${attempt} for ${siteKey}: ${url}`);
-        let browser = null;
-        let page = null;
+      async () => {
+        const browser = await getSharedBrowser();
+        const page = await browser.newPage();
 
-        try {
-          if (isRateX) {
-            browser = await puppeteer.launch({
-              args: chromium.args,
-              defaultViewport: chromium.defaultViewport,
-              executablePath: await chromium.executablePath(),
-              headless: chromium.headless,
-            });
-          } else {
-            browser = await getSharedBrowser();
-          }
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        await page.evaluateOnNewDocument(() => {
+          Object.defineProperty(navigator, 'webdriver', { get: () => false });
+          window.chrome = { runtime: {} };
+        });
 
-          page = await browser.newPage();
+        await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
 
-          await page.evaluateOnNewDocument(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            window.chrome = { runtime: {} };
-          });
+        // Закрываем модалку
+        await page.evaluate(() => {
+          document.querySelectorAll('button[aria-label*="close" i], button svg, [role="dialog"] button').forEach(b => b.click());
+        });
+        await sleep(1500);
 
-          await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-          );
+        // Ждём APY
+        await page.waitForFunction(() => document.body.innerText.includes('Total APY'), { timeout: 10000 }).catch(() => {});
 
-          // ТАЙМАУТ НА GOTO
-          await page.goto(url, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000,
-            signal: controller.signal
-          });
+        const found = await page.evaluate((labels, hint) => {
+          const results = {};
+          const extract = text => (text.match(/(-?[\d,]+(?:\.\d+)?)%/) || [])[1]?.replace(/,/g, '');
+          const elements = Array.from(document.querySelectorAll('body *')).filter(el => el.innerText?.length < 1000);
 
-          // Ожидание APY
-          if (isRateX) {
-            await Promise.race([
-              page.waitForFunction(
-                () => document.body.innerText.includes('Fixed APY') || document.body.innerText.includes('Total Combined APY'),
-                { timeout: 10000 }
-              ).catch(() => {}),
-            ]);
-          } else {
-            await Promise.race([
-              page.waitForFunction(
-                (labels) => {
-                  const text = document.body.innerText.toLowerCase();
-                  return /apy|%/.test(text) || labels.some(l => text.includes(l.toLowerCase()));
-                },
-                { timeout: 10000 },
-                labels
-              ).catch(() => {}),
-            ]);
-          }
-
-          await sleep(1500);
-          const pageText = await page.evaluate(() => document.body.innerText);
-
-          // === Парсинг (без изменений) ===
-          const found = await page.evaluate((labels, tokenHint) => {
-            const results = {};
-
-            function extractPercent(text) {
-              if (!text) return null;
-              const match = text.match(/(-?[\d,]+(?:\.\d+)?)\s*%/) ||
-                            text.match(/(-?[\d,]+(?:\.\d+)?)%/);
-              if (!match) return null;
-              const num = parseFloat(match[1].replace(/,/g, ''));
-              if (isNaN(num)) return null;
-              if (num === 100 && !text.toLowerCase().includes('apy')) return null;
-              return num;
-            }
-
-            const elements = Array.from(document.querySelectorAll('body *'))
-              .filter(el => el.innerText && el.innerText.length < 1000);
-
-            for (const el of elements) {
-              const text = el.innerText;
-              const lowerText = text.toLowerCase();
-
-              if (lowerText.includes('fixed apy') || lowerText.includes('total combined apy')) {
-                const percent = extractPercent(text);
-                if (percent !== null) {
-                  let key = lowerText.includes('fixed') ? 'Fixed APY' : 'Total Combined APY';
-                  if (!results[key]) {
-                    results[key] = { percent, context: text.slice(0, 400), source: 'explicit' };
-                  }
-                  continue;
-                }
-              }
-
-              for (const label of labels) {
-                const labelLower = label.toLowerCase();
-                if (lowerText.includes(labelLower) && !results[label]) {
-                  const percent = extractPercent(text);
-                  if (percent !== null) {
-                    results[label] = { percent, context: text.slice(0, 400), source: 'same-element' };
-                    continue;
-                  }
-
-                  const parent = el.parentElement;
-                  if (parent) {
-                    const siblings = Array.from(parent.children);
-                    for (const sib of siblings) {
-                      if (sib === el) continue;
-                      const p = extractPercent(sib.innerText);
-                      if (p !== null) {
-                        results[label] = { percent: p, context: sib.innerText.slice(0, 400), source: 'sibling' };
-                        break;
-                      }
-                    }
-                  }
-                }
+          for (const el of elements) {
+            const text = el.innerText;
+            const lower = text.toLowerCase();
+            for (const label of labels) {
+              if (lower.includes(label.toLowerCase()) && !results[label]) {
+                const p = extract(text) || extract(el.parentElement?.innerText);
+                if (p) results[label] = { percent: parseFloat(p) };
               }
             }
-
-            if (Object.keys(results).length === 0) {
-              const text = document.body.innerText;
-              const apyMatches = [...text.matchAll(/(?:APY|Total Combined).*?(-?[\d,]+(?:\.\d+)?)\s*%?/gi)] ||
-                                [...text.matchAll(/(-?[\d,]+(?:\.\d+)?)%/g)];
-              for (const m of apyMatches) {
-                const window = m[0].toLowerCase();
-                for (const label of labels) {
-                  if (!results[label] && window.includes(label.toLowerCase())) {
-                    const num = parseFloat(m[1]?.replace(/,/g, '') || m[0].match(/[\d.]+/)[0]);
-                    if (!isNaN(num)) {
-                      results[label] = { percent: num, context: window, source: 'APY-block' };
-                    }
-                  }
-                }
-              }
-            }
-
-            return results;
-          }, labels, tokenHint);
-
-          // === Маппинг ===
-          const mapLabel = (label, tokenHint) => {
-            const l = label.toLowerCase();
-            if (l.includes('fixed apy')) {
-              const map = { 'xSOL': 'PT-xSOL', 'hyUSD': 'PT-hyUSD', 'sHYUSD': 'PT-sHYUSD', 'hyloSOL+': 'PT-hyloSOL+', 'hyloSOL': 'PT-hyloSOL' };
-              return map[tokenHint] || 'PT-' + tokenHint.toUpperCase();
-            }
-            if (l.includes('total combined apy') || l.includes('variable apy')) {
-              const map = { 'xSOL': 'xSOL', 'hyUSD': 'hyUSD', 'sHYUSD': 'sHYUSD', 'hyloSOL+': 'hyloSOL+', 'hyloSOL': 'hyloSOL' };
-              return map[tokenHint] || tokenHint.toUpperCase();
-            }
-            if (l.includes('pt') && l.includes('xsol')) return 'PT-xSOL';
-            if (l.includes('pt') && l.includes('hyusd') && !l.includes('shyusd')) return 'PT-hyUSD';
-            if (l.includes('pt') && l.includes('shyusd')) return 'PT-sHYUSD';
-            if (l.includes('pt') && l.includes('hylosol') && l.includes('+')) return 'PT-hyloSOL+';
-            if (l.includes('pt') && l.includes('hylosol') && !l.includes('+')) return 'PT-hyloSOL';
-            if (l.includes('xsol') && !l.includes('pt')) return 'xSOL';
-            if (l.includes('hyusd') && !l.includes('pt') && !l.includes('shyusd')) return 'hyUSD';
-            if (l.includes('shyusd') && !l.includes('pt')) return 'sHYUSD';
-            if (l.includes('hylosol') && l.includes('+') && !l.includes('pt')) return 'hyloSOL+';
-            if (l.includes('hylosol') && !l.includes('+') && !l.includes('pt')) return 'hyloSOL';
-            return null;
-          };
-
-          const normalized = {
-            'PT-xSOL': null, 'xSOL': null,
-            'PT-hyUSD': null, 'hyUSD': null,
-            'PT-sHYUSD': null, 'sHYUSD': null,
-            'PT-hyloSOL+': null, 'hyloSOL+': null,
-            'PT-hyloSOL': null, 'hyloSOL': null
-          };
-
-          for (const [key, val] of Object.entries(found)) {
-            const mapped = mapLabel(key, tokenHint);
-            if (mapped && !normalized[mapped]) {
-              normalized[mapped] = val;
-            }
           }
+          return results;
+        }, LABELS_EXPONENT, tokenHint);
 
-          const nonNull = Object.fromEntries(Object.entries(normalized).filter(([_, v]) => v !== null));
-          console.log(`Parsed ${siteKey} (${tokenHint}):`, nonNull);
+        const map = {
+          'xSOL': 'xSOL', 'PT-xSOL': 'PT-xSOL',
+          'hyUSD': 'hyUSD', 'PT-hyUSD': 'PT-hyUSD',
+          'sHYUSD': 'sHYUSD', 'shyusd': 'sHYUSD',
+          'hyloSOL+': 'hyloSOL+', 'PT-hyloSOL+': 'PT-hyloSOL+',
+          'hyloSOL': 'hyloSOL', 'PT-hyloSOL': 'PT-hyloSOL'
+        };
 
-          await page.close();
-          if (isRateX) await browser.close();
-
-          clearTimeout(globalTimeout);
-          return { ok: true, data: normalized, textSnippet: pageText.slice(0, 2000) };
-
-        } catch (err) {
-          clearTimeout(globalTimeout);
-          throw err;
+        const normalized = { 'PT-xSOL': null, 'xSOL': null, 'PT-hyUSD': null, 'hyUSD': null, 'PT-sHYUSD': null, 'sHYUSD': null, 'PT-hyloSOL+': null, 'hyloSOL+': null, 'PT-hyloSOL': null, 'hyloSOL': null };
+        for (const [k, v] of Object.entries(found)) {
+          const m = map[k] || map[k.toLowerCase()];
+          if (m && !normalized[m]) normalized[m] = v;
         }
+
+        await page.close();
+        clearTimeout(timeout);
+        console.log(`Exponent ${siteKey}:`, normalized);
+        return { ok: true, data: normalized };
       },
-      {
-        retries: 1,
-        onFailedAttempt: (failure) => {
-          console.warn(`Attempt ${failure.attemptNumber} failed for ${siteKey}:`, failure.error?.message || 'Unknown');
-        },
-      }
+      { retries: 1 }
     );
   } catch (err) {
-    clearTimeout(globalTimeout);
-    console.error(`ABORTED ${siteKey}:`, err.message);
-    return { ok: false, data: null };
+    clearTimeout(timeout);
+    console.error(`Exponent ${siteKey} failed:`, err.message);
+    return { ok: false };
   }
 }
 
-// === API: /api/apy с ГЛОБАЛЬНЫМ ТАЙМАУТОМ ===
-app.get('/api/apy', async (req, res) => {
-  const globalTimeout = setTimeout(() => {
-    res.status(504).json({ ok: false, error: 'Gateway timeout' });
-  }, 180000); // 3 минуты максимум
+// === fetchRateXApy (RateX via fetch) ===
+async function fetchRateXApy(url, hint) {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,*/*'
+      }
+    });
+    const html = await res.text();
 
+    const fixed = html.match(/Fixed APY[^>]*>[\s]*([\d.]+)%/i);
+    const total = html.match(/Total Combined APY[^>]*>[\s]*([\d.]+)%/i) || html.match(/Variable APY[^>]*>[\s]*([\d.]+)%/i);
+
+    const pt = fixed ? parseFloat(fixed[1]) : null;
+    const base = total ? parseFloat(total[1]) : null;
+
+    console.log(`RateX ${hint}: PT=${pt}%, Base=${base}%`);
+    return {
+      ok: true,
+      data: {
+        [`PT-${hint}`]: { percent: pt },
+        [hint]: { percent: base }
+      }
+    };
+  } catch (err) {
+    console.error(`RateX ${hint} failed:`, err.message);
+    return { ok: false };
+  }
+}
+
+// === /api/apy ===
+app.get('/api/apy', async (req, res) => {
+  const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 180000);
   try {
     const now = Date.now();
     const force = req.query.force === '1';
 
-    if (!force && cache.data && (now - cache.ts) < CACHE_TTL_MS) {
+    if (!force && cache.data && now - cache.ts < CACHE_TTL_MS) {
       clearTimeout(globalTimeout);
-      return res.json({ ok: true, source: 'cache', data: cache.data, cached_at: new Date(cache.ts).toISOString() });
+      return res.json({ ok: true, source: 'cache', data: cache.data });
     }
 
     const results = {};
 
-    // === Exponent: ПОСЛЕДОВАТЕЛЬНО с ТАЙМАУТОМ ===
+    // === Exponent (последовательно) ===
     const expTasks = [
       { key: 'exponent-xsol-1', url: EXPONENT_XSOL_1, hint: 'xSOL' },
       { key: 'exponent-xsol-2', url: EXPONENT_XSOL_2, hint: 'xSOL' },
@@ -326,48 +206,30 @@ app.get('/api/apy', async (req, res) => {
     ];
 
     for (const task of expTasks) {
-      const taskTimeout = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Task timeout')), 45000)
-      );
-      try {
-        const data = await Promise.race([
-          fetchApysFromPage(task.url, LABELS_EXPONENT, task.key, task.hint, false),
-          taskTimeout
-        ]);
-        results[task.key] = data.ok ? data.data : null;
-        console.log(`Success: ${task.key}`);
-      } catch (err) {
-        console.error(`Failed/Timeout: ${task.key}`);
-        results[task.key] = null;
-      }
+      const data = await Promise.race([
+        fetchExponentApys(task.url, task.key, task.hint),
+        new Promise((_, r) => setTimeout(() => r({ ok: false }), 45000))
+      ]);
+      results[task.key] = data.ok ? data.data : null;
     }
 
-    // === RateX: ПАРАЛЛЕЛЬНО с ТАЙМАУТОМ ===
-    const ratexTasks = [
-      { key: 'ratex-xsol', url: RATEX_XSOL, hint: 'xSOL' },
-      { key: 'ratex-hyusd', url: RATEX_HYUSD, hint: 'hyUSD' },
-      { key: 'ratex-hylosolplus', url: RATEX_HYLOSOL_PLUS, hint: 'hyloSOL+' },
-      { key: 'ratex-hylosol', url: RATEX_HYLOSOL, hint: 'hyloSOL' },
-      { key: 'ratex-shyusd', url: RATEX_SHYUSD, hint: 'sHYUSD' },
-    ];
+    // === RateX (параллельно, fetch) ===
+    const ratexResults = await Promise.allSettled([
+      fetchRateXApy(RATEX_XSOL, 'xSOL'),
+      fetchRateXApy(RATEX_HYUSD, 'hyUSD'),
+      fetchRateXApy(RATEX_HYLOSOL_PLUS, 'hyloSOL+'),
+      fetchRateXApy(RATEX_HYLOSOL, 'hyloSOL'),
+      fetchRateXApy(RATEX_SHYUSD, 'sHYUSD')
+    ]);
 
-    const ratexSettled = await Promise.allSettled(
-      ratexTasks.map(t =>
-        Promise.race([
-          fetchApysFromPage(t.url, LABELS_RATEX, t.key, t.hint, true),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('RateX timeout')), 30000))
-        ]).catch(() => ({ ok: false }))
-      )
-    );
-
-    ratexTasks.forEach((t, i) => {
-      const res = ratexSettled[i];
-      results[t.key] = res.status === 'fulfilled' && res.value.ok ? res.value.data : null;
+    const ratexKeys = ['ratex-xsol', 'ratex-hyusd', 'ratex-hylosolplus', 'ratex-hylosol', 'ratex-shyusd'];
+    ratexKeys.forEach((key, i) => {
+      const res = ratexResults[i];
+      results[key] = res.status === 'fulfilled' && res.value.ok ? res.value.data : null;
     });
 
     // === Ответ ===
     const get = (obj, key) => obj?.[key]?.percent ?? null;
-
     const data = {
       exponent_xSOL_1: get(results['exponent-xsol-1'], 'xSOL'),
       exponent_PT_xSOL_1: get(results['exponent-xsol-1'], 'PT-xSOL'),
@@ -397,52 +259,14 @@ app.get('/api/apy', async (req, res) => {
     cache = { ts: now, data };
     clearTimeout(globalTimeout);
     res.json({ ok: true, source: 'live', data });
-
   } catch (e) {
     clearTimeout(globalTimeout);
-    console.error('API /api/apy error:', e);
     res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
-// === /api/calc ===
-app.post('/api/calc', (req, res) => {
-  try {
-    const { principal, rate, rateType = 'APY', days, compoundingPerYear = 365 } = req.body;
-    const P = Number(principal || 0);
-    const r = Number(rate || 0) / 100;
-    const d = Number(days || 0);
-    const n = Number(compoundingPerYear);
-
-    if (!P || !d) return res.status(400).json({ ok: false, error: 'principal and days required' });
-
-    let final = 0;
-    if (rateType.toUpperCase() === 'APY') {
-      final = P * Math.pow(1 + r, d / 365);
-    } else {
-      const apy = Math.pow(1 + r / n, n) - 1;
-      final = P * Math.pow(1 + apy, d / 365);
-    }
-
-    const profit = final - P;
-    res.json({ ok: true, principal: P, final, profit, days: d });
-
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 // === /health ===
-app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
-// === Shutdown ===
-process.on('SIGINT', async () => {
-  console.log('Shutting down...');
-  if (sharedBrowser) {
-    try { await sharedBrowser.close(); } catch (e) {}
-  }
-  process.exit(0);
-});
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Backend running on http://localhost:${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Backend running on ${PORT}`));
