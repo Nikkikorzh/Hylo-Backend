@@ -140,6 +140,7 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
 }
 
 // === /api/apy ===
+// === /api/apy (RateX ПЕРВЫМ!) ===
 app.get('/api/apy', async (req, res) => {
   const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Timeout' }), 300000);
   try {
@@ -153,24 +154,8 @@ app.get('/api/apy', async (req, res) => {
 
     const results = {};
 
-    // === Exponent ===
-    const expTasks = [
-      { key: 'exponent-xsol-1', url: EXPONENT_XSOL_1, hint: 'xSOL' },
-      { key: 'exponent-xsol-2', url: EXPONENT_XSOL_2, hint: 'xSOL' },
-      { key: 'exponent-hyusd', url: EXPONENT_HYUSD, hint: 'hyUSD' },
-      { key: 'exponent-hylosolplus', url: EXPONENT_HYLOSOL_PLUS, hint: 'hyloSOL+' },
-      { key: 'exponent-hylosol', url: EXPONENT_HYLOSOL, hint: 'hyloSOL' },
-      { key: 'exponent-shyusd', url: EXPONENT_SHYUSD, hint: 'sHYUSD' },
-    ];
-
-    for (const task of expTasks) {
-      const data = await fetchApys(task.url, task.key, task.hint, false);
-      if (data.ok) {
-        results[task.key] = { apy: data.data.apy };
-      }
-    }
-
-    // === RateX ===
+    // === 1. RATEX ПЕРВЫМ (параллельно) ===
+    console.log('Starting RateX (first)...');
     const ratexResults = await Promise.allSettled([
       fetchApys(RATEX_XSOL, 'ratex-xsol', 'xSOL', true),
       fetchApys(RATEX_HYUSD, 'ratex-hyusd', 'hyUSD', true),
@@ -185,6 +170,15 @@ app.get('/api/apy', async (req, res) => {
         results[key] = { pt: res.value.data.pt, base: res.value.data.base };
       }
     });
+
+    // === 2. Exponent ПОСЛЕ (последовательно) ===
+    console.log('Starting Exponent (after RateX)...');
+    for (const [key, url] of Object.entries(EXPONENT_URLS)) {
+      const data = await fetchApys(url, key, null, false);
+      if (data.ok) {
+        results[key] = { apy: data.data.apy };
+      }
+    }
 
     // === Ответ ===
     const get = (obj, key) => obj?.[key] ?? null;
@@ -219,6 +213,7 @@ app.get('/api/apy', async (req, res) => {
     res.json({ ok: true, source: 'live', data });
   } catch (e) {
     clearTimeout(globalTimeout);
+    console.error('API error:', e);
     res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
