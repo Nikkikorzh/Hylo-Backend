@@ -240,11 +240,11 @@ app.get('/api/apy', async (req, res) => {
     };
 
     // === СОХРАНЯЕМ В REDIS НА 10 МИНУТ ===
-    await redisClient.setEx('apy_cache', 600, JSON.stringify(data));
-    console.log('Data saved to Redis cache for 10 minutes');
+    await redisClient.setEx('apy_cache', 900, JSON.stringify(data));
+    console.log('Data saved to Redis cache for 15 minutes');
 
     clearTimeout(globalTimeout);
-    res.setHeader('Cache-Control', 's-maxage=600, stale-while-revalidate=120');
+    res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=120');
     res.json({ ok: true, source: 'live', data });
   } catch (e) {
     clearTimeout(globalTimeout);
@@ -255,15 +255,15 @@ app.get('/api/apy', async (req, res) => {
 
 // ==================== АВТО-ОБНОВЛЕНИЕ КАЖДЫЕ 10 МИНУТ ====================
 setInterval(async () => {
-  console.log('Auto-refresh cache triggered...');
+  console.log('Auto-refresh cache triggered (15 minutes)...');
   try {
     // Дёргаем свой API с force=1
     await fetch(`http://localhost:${process.env.PORT || 10000}/api/apy?force=1`);
-    console.log('Auto-refresh completed successfully');
+    console.log('Auto-refresh completed successfully (next 15 minutes)');
   } catch (e) {
     console.error('Auto-refresh failed:', e.message);
   }
-}, 10 * 60 * 1000); // каждые 10 минут
+}, 15 * 60 * 1000); // каждые 10 минут
 
 // ==================== HEALTH ====================
 app.get('/health', (req, res) => res.json({ ok: true }));
