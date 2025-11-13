@@ -12,23 +12,12 @@ const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.use(express.json());
 
-// ==================== REDIS ====================
-const redisClient = createClient({
-  url: process.env.REDIS_URL // redis://red-xxx.onrender.com:6379
-});
+// === Redis ===
+const redisClient = createClient({ url: process.env.REDIS_URL });
+redisClient.on('error', err => console.error('Redis error:', err));
+(async () => { await redisClient.connect(); console.log('Redis connected'); })();
 
-redisClient.on('error', (err) => console.error('Redis error:', err));
-
-(async () => {
-  try {
-    await redisClient.connect();
-    console.log('Redis connected successfully');
-  } catch (err) {
-    console.error('Redis connection failed:', err);
-  }
-})();
-
-// ==================== URLS ====================
+// === URLs ===
 const EXPONENT_URLS = {
   'exponent-xsol-1': 'https://www.exponent.finance/liquidity/xsol-26Nov25-1',
   'exponent-xsol-2': 'https://www.exponent.finance/liquidity/xsol-26Nov25',
@@ -46,7 +35,19 @@ const RATEX_URLS = {
   'ratex-shyusd': 'https://app.rate-x.io/points?symbol=sHYUSD-2601',
 };
 
-// ==================== PUPPETEER ====================
+const LOOPSCALE_VAULTS = {
+  'loopscale-hyusd-one': 'https://app.loopscale.com/vault/hyusd_one',
+  'loopscale-xsol-one': 'https://app.loopscale.com/vault/xsol_one',
+};
+
+const LOOPSCALE_LOOPS = {
+  'loopscale-hyusd-15dec25': 'https://app.loopscale.com/loops/hyusd-15dec25-hyusd',
+  'loopscale-shyusd-18nov25': 'https://app.loopscale.com/loops/shyusd-18nov25-hyusd',
+  'loopscale-shyusd-hyusd': 'https://app.loopscale.com/loops/shyusd-hyusd',
+  'loopscale-shyusd-2601': 'https://app.loopscale.com/loops/shyusd-2601-hyusd',
+};
+
+// === Shared Browser ===
 let sharedBrowser = null;
 let isLaunching = false;
 
@@ -57,37 +58,23 @@ async function getSharedBrowser() {
     return sharedBrowser;
   }
   isLaunching = true;
-  console.log('Puppeteer browser launching...');
+  console.log('Puppeteer launching...');
   try {
     sharedBrowser = await puppeteer.launch({
-      args: [
-        ...chromium.args,
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox'
-      ],
-      defaultViewport: chromium.defaultViewport,
+      args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
     });
-    console.log('Puppeteer browser launched');
-  } catch (err) {
-    console.error('Failed to launch browser:', err);
-    throw err;
-  } finally {
-    isLaunching = false;
-  }
+    console.log('Puppeteer launched');
+  } catch (e) { console.error('Puppeteer error:', e); throw e; }
+  finally { isLaunching = false; }
   return sharedBrowser;
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ==================== ПАРСИНГ ====================
-async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
+// === Парсинг (безопасный) ===
+async function fetchApys(url, siteKey, tokenHint, isRateX = false, isLoopscale = false) {
   let timedOut = false;
   const timeout = setTimeout(() => { timedOut = true; }, isRateX ? 90000 : 60000);
 
@@ -106,19 +93,22 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
 
       await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
 
-      if (!isRateX) {
+      if (!isRateX && !isLoopscale) {
         await page.evaluate(() => {
           document.querySelectorAll('button[aria-label*="close" i], button svg, [role="dialog"] button')
             .forEach(b => b.click());
         });
         await sleep(1500);
         await page.waitForFunction(() => document.body.innerText.includes('Total APY'), { timeout: 15000 }).catch(() => {});
-      } else {
+      } else if (isRateX) {
         await page.waitForFunction(() => document.body.innerText.includes('Fixed APY'), { timeout: 30000 }).catch(() => {});
         await sleep(3000);
+      } else if (isLoopscale) {
+        await page.waitForFunction(() => document.body.innerText.includes('APY'), { timeout: 30000 }).catch(() => {});
+        await sleep(2000);
       }
 
-      const data = await page.evaluate((isRateX, hint) => {
+      const data = await page.evaluate((isRateX, isLoopscale, hint) => {
         const text = document.body.innerText;
         const extract = regex => (text.match(regex) || [])[1]?.replace(/,/g, '');
 
@@ -126,24 +116,29 @@ async function fetchApys(url, siteKey, tokenHint, isRateX = false) {
           const pt = extract(/Fixed APY[^0-9]*([\d.]+)%/i);
           const base = extract(/Total Combined APY[^0-9]*([\d.]+)%/i) || extract(/Variable APY[^0-9]*([\d.]+)%/i);
           return { pt: pt ? parseFloat(pt) : null, base: base ? parseFloat(base) : null };
+        } else if (isLoopscale) {
+          const apy = extract(/APY[^0-9]*([\d.]+)%/i);
+          const tvl = extract(/\$[\d,]+\.?\d*[^<]*$/i);
+          return { apy: apy ? parseFloat(apy) : null, tvl: tvl ? parseFloat(tvl.replace(/[^\d.]/g, '')) : null };
         }
+
         const apy = extract(/Total APY[^0-9]*([\d.]+)%/i);
         return { apy: apy ? parseFloat(apy) : null };
-      }, isRateX, tokenHint);
+      }, isRateX, isLoopscale, tokenHint);
 
       await page.close();
       clearTimeout(timeout);
-      console.log(`${isRateX ? 'RateX' : 'Exponent'} ${siteKey}:`, data);
+      console.log(`${isRateX ? 'RateX' : isLoopscale ? 'Loopscale' : 'Exponent'} ${siteKey}:`, data);
       return { ok: true, data };
     }, { retries: 1 });
   } catch (err) {
     clearTimeout(timeout);
-    console.warn(`${isRateX ? 'RateX' : 'Exponent'} ${siteKey} error:`, err.message);
+    console.warn(`${isRateX ? 'RateX' : isLoopscale ? 'Loopscale' : 'Exponent'} ${siteKey} error:`, err.message);
     return { ok: false };
   }
 }
 
-// ==================== КАЛЬКУЛЯТОР ====================
+// === Калькулятор ===
 app.post('/api/calc', (req, res) => {
   try {
     const { principal, rate, rateType = 'APY', days, compoundingPerYear = 365 } = req.body;
@@ -174,7 +169,7 @@ app.post('/api/calc', (req, res) => {
   }
 });
 
-// ==================== /api/apy ====================
+// === /api/apy ===
 app.get('/api/apy', async (req, res) => {
   const globalTimeout = setTimeout(() => res.status(504).json({ ok: false, error: 'Global timeout' }), 600000);
   try {
@@ -195,9 +190,9 @@ app.get('/api/apy', async (req, res) => {
       console.log('Force refresh — skipping cache');
     }
 
-    // === ПАРСИНГ ===
     const results = {};
 
+    // === RateX ===
     console.log('Starting RateX parsing...');
     for (const [key, url] of Object.entries(RATEX_URLS)) {
       const hint = key.split('-')[1].toUpperCase().replace('SHYUSD', 'sHYUSD');
@@ -205,15 +200,28 @@ app.get('/api/apy', async (req, res) => {
       results[key] = data.ok ? { pt: data.data.pt, base: data.data.base } : { pt: null, base: null };
     }
 
+    // === Exponent ===
     console.log('Starting Exponent parsing...');
     for (const [key, url] of Object.entries(EXPONENT_URLS)) {
       const data = await fetchApys(url, key, null, false);
       results[key] = data.ok ? { apy: data.data.apy } : { apy: null };
     }
 
-    // === ФОРМИРУЕМ ОТВЕТ ===
+    // === Loopscale ===
+    console.log('Starting Loopscale parsing...');
+    for (const [key, url] of Object.entries(LOOPSCALE_VAULTS)) {
+      const data = await fetchApys(url, key, null, false, true);
+      results[key] = data.ok ? { apy: data.data.apy, tvl: data.data.tvl } : { apy: null, tvl: null };
+    }
+    for (const [key, url] of Object.entries(LOOPSCALE_LOOPS)) {
+      const data = await fetchApys(url, key, null, false, true);
+      results[key] = data.ok ? { apy: data.data.apy, tvl: data.data.tvl } : { apy: null, tvl: null };
+    }
+
+    // === ОТВЕТ ===
     const get = (obj, key) => obj?.[key] ?? null;
     const data = {
+      // Exponent
       exponent_xSOL_1: get(results['exponent-xsol-1'], 'apy'),
       exponent_PT_xSOL_1: get(results['exponent-xsol-1'], 'apy'),
       exponent_xSOL_2: get(results['exponent-xsol-2'], 'apy'),
@@ -224,6 +232,7 @@ app.get('/api/apy', async (req, res) => {
       exponent_hylosol: get(results['exponent-hylosol'], 'apy'),
       exponent_sHYUSD: get(results['exponent-shyusd'], 'apy'),
 
+      // RateX
       ratex_xSOL: get(results['ratex-xsol'], 'base'),
       ratex_PT_xSOL: get(results['ratex-xsol'], 'pt'),
       ratex_hyUSD: get(results['ratex-hyusd'], 'base'),
@@ -235,16 +244,24 @@ app.get('/api/apy', async (req, res) => {
       ratex_sHYUSD: get(results['ratex-shyusd'], 'base'),
       ratex_PT_sHYUSD: get(results['ratex-shyusd'], 'pt'),
 
+      // Loopscale
+      loopscale_hyusd_one: get(results['loopscale-hyusd-one'], 'apy'),
+      loopscale_xsOL_one: get(results['loopscale-xsol-one'], 'apy'),
+      loopscale_hyusd_15dec25: get(results['loopscale-hyusd-15dec25'], 'apy'),
+      loopscale_shYUSD_18nov25: get(results['loopscale-shyusd-18nov25'], 'apy'),
+      loopscale_shYUSD_hyusd: get(results['loopscale-shyusd-hyusd'], 'apy'),
+      loopscale_shYUSD_2601: get(results['loopscale-shyusd-2601'], 'apy'),
+
       fetched_at: new Date().toISOString(),
       partial: true
     };
 
-    // === СОХРАНЯЕМ В REDIS НА 10 МИНУТ ===
+    // === СОХРАНЯЕМ В REDIS НА 15 МИНУТ ===
     await redisClient.setEx('apy_cache', 900, JSON.stringify(data));
     console.log('Data saved to Redis cache for 15 minutes');
 
     clearTimeout(globalTimeout);
-    res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=120');
+    res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=180');
     res.json({ ok: true, source: 'live', data });
   } catch (e) {
     clearTimeout(globalTimeout);
@@ -253,17 +270,16 @@ app.get('/api/apy', async (req, res) => {
   }
 });
 
-// ==================== АВТО-ОБНОВЛЕНИЕ КАЖДЫЕ 10 МИНУТ ====================
+// ==================== АВТО-ОБНОВЛЕНИЕ КАЖДЫЕ 15 МИНУТ ====================
 setInterval(async () => {
-  console.log('Auto-refresh cache triggered (15 minutes)...');
+  console.log('Auto-refresh (every 15 min) triggered...');
   try {
-    // Дёргаем свой API с force=1
     await fetch(`http://localhost:${process.env.PORT || 10000}/api/apy?force=1`);
-    console.log('Auto-refresh completed successfully (next 15 minutes)');
+    console.log('Auto-refresh completed — data fresh for next 15 min');
   } catch (e) {
     console.error('Auto-refresh failed:', e.message);
   }
-}, 15 * 60 * 1000); // каждые 10 минут
+}, 15 * 60 * 1000); // 15 минут
 
 // ==================== HEALTH ====================
 app.get('/health', (req, res) => res.json({ ok: true }));
